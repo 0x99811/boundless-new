@@ -12,1825 +12,1102 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::chain_monitor::ChainHead;
-use crate::OrderRequest;
-use crate::{
-    chain_monitor::ChainMonitorService,
-    config::{ConfigLock, OrderCommitmentPriority},
-    db::DbObj,
-    errors::CodedError,
-    impl_coded_debug, now_timestamp,
-    task::{RetryRes, RetryTask, SupervisorErr},
-    utils, FulfillmentType, Order,
-};
+use std::{path::PathBuf, sync::Arc, time::SystemTime};
+
+use crate::storage::create_uri_handler;
 use alloy::{
     network::Ethereum,
-    primitives::{
-        utils::{format_ether, parse_units},
-        Address, U256,
-    },
+    primitives::{Address, Bytes, FixedBytes, U256},
     providers::{Provider, WalletProvider},
+    signers::local::PrivateKeySigner,
 };
 use anyhow::{Context, Result};
-use boundless_market::contracts::{
-    boundless_market::{BoundlessMarketService, MarketError},
-    IBoundlessMarket::IBoundlessMarketErrors,
-    RequestId, RequestStatus, TxnErr,
+use boundless_market::{
+    contracts::{boundless_market::BoundlessMarketService, ProofRequest},
+    order_stream_client::OrderStreamClient,
+    selector::is_groth16_selector,
+    Deployment,
 };
-use boundless_market::selector::SupportedSelectors;
-use moka::{future::Cache, Expiry};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use chrono::{serde::ts_seconds, DateTime, Utc};
+use clap::Parser;
+pub use config::Config;
+use config::ConfigWatcher;
+use db::{DbObj, SqliteDb};
+use provers::ProverObj;
+use risc0_ethereum_contracts::set_verifier::SetVerifierService;
+use risc0_zkvm::sha::Digest;
+pub use rpc_retry_policy::CustomRetryPolicy;
+use serde::{Deserialize, Serialize};
+use task::{RetryPolicy, Supervisor};
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use std::str::FromStr;
+use url::Url;
 
-/// Hard limit on the number of orders to concurrently kick off proving work for.
-const MAX_PROVING_BATCH_SIZE: u32 = 10;
+const NEW_ORDER_CHANNEL_CAPACITY: usize = 1000;
+const PRICING_CHANNEL_CAPACITY: usize = 1000;
+const ORDER_STATE_CHANNEL_CAPACITY: usize = 1000;
 
-#[derive(Error)]
-pub enum OrderMonitorErr {
-    #[error("{code} Failed to lock order: {0}", code = self.code())]
-    LockTxFailed(String),
+pub(crate) mod aggregator;
+pub(crate) mod chain_monitor;
+pub mod config;
+pub(crate) mod db;
+pub(crate) mod errors;
+pub mod futures_retry;
+pub(crate) mod market_monitor;
+pub(crate) mod offchain_market_monitor;
+pub(crate) mod order_monitor;
+pub(crate) mod order_picker;
+pub(crate) mod prioritization;
+pub(crate) mod provers;
+pub(crate) mod proving;
+pub(crate) mod reaper;
+pub(crate) mod rpc_retry_policy;
+pub(crate) mod storage;
+pub(crate) mod submitter;
+pub(crate) mod task;
+pub(crate) mod utils;
 
-    #[error("{code} Failed to confirm lock tx: {0}", code = self.code())]
-    LockTxNotConfirmed(String),
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about, long_about = None)]
+pub struct Args {
+    /// sqlite database connection url
+    #[clap(short = 's', long, env, default_value = "sqlite::memory:")]
+    pub db_url: String,
 
-    #[error("{code} Insufficient balance for lock", code = self.code())]
-    InsufficientBalance,
+    /// RPC URL
+    #[clap(long, env, default_value = "http://localhost:8545")]
+    pub rpc_url: Url,
 
-    #[error("{code} Order already locked", code = self.code())]
-    AlreadyLocked,
+    /// wallet key
+    #[clap(long, env)]
+    pub private_key: PrivateKeySigner,
 
-    #[error("{code} RPC error: {0:?}", code = self.code())]
-    RpcErr(anyhow::Error),
+    /// Boundless deployment configuration (contract addresses, etc.)
+    #[clap(flatten, next_help_heading = "Boundless Deployment")]
+    pub deployment: Option<Deployment>,
 
-    #[error("{code} Unexpected error: {0:?}", code = self.code())]
-    UnexpectedError(#[from] anyhow::Error),
+    /// local prover API (Bento)
+    ///
+    /// Setting this value toggles using Bento for proving and disables Bonsai
+    #[clap(long, env, default_value = "http://localhost:8081", conflicts_with_all = ["bonsai_api_url", "bonsai_api_key"])]
+    pub bento_api_url: Option<Url>,
+
+    /// Bonsai API URL
+    ///
+    /// Toggling this disables Bento proving and uses Bonsai as a backend
+    #[clap(long, env, conflicts_with = "bento_api_url")]
+    pub bonsai_api_url: Option<Url>,
+
+    /// Bonsai API Key
+    ///
+    /// Required if using BONSAI_API_URL
+    #[clap(long, env, conflicts_with = "bento_api_url")]
+    pub bonsai_api_key: Option<String>,
+
+    /// Config file path
+    #[clap(short, long, default_value = "broker.toml")]
+    pub config_file: PathBuf,
+
+    /// Pre deposit amount
+    ///
+    /// Amount of stake tokens to pre-deposit into the contract for staking eg: 100
+    #[clap(short, long)]
+    pub deposit_amount: Option<U256>,
+
+    /// RPC HTTP retry rate limit max retry
+    ///
+    /// From the `RetryBackoffLayer` of Alloy
+    #[clap(long, default_value_t = 10)]
+    pub rpc_retry_max: u32,
+
+    /// RPC HTTP retry backoff (in ms)
+    ///
+    /// From the `RetryBackoffLayer` of Alloy
+    #[clap(long, default_value_t = 1000)]
+    pub rpc_retry_backoff: u64,
+
+    /// RPC HTTP retry compute-unit per second
+    ///
+    /// From the `RetryBackoffLayer` of Alloy
+    #[clap(long, default_value_t = 100)]
+    pub rpc_retry_cu: u64,
+
+    /// Log JSON
+    #[clap(long, env, default_value_t = false)]
+    pub log_json: bool,
 }
 
-impl_coded_debug!(OrderMonitorErr);
-
-impl CodedError for OrderMonitorErr {
-    fn code(&self) -> &str {
-        match self {
-            OrderMonitorErr::LockTxNotConfirmed(_) => "[B-OM-006]",
-            OrderMonitorErr::LockTxFailed(_) => "[B-OM-007]",
-            OrderMonitorErr::AlreadyLocked => "[B-OM-009]",
-            OrderMonitorErr::InsufficientBalance => "[B-OM-010]",
-            OrderMonitorErr::RpcErr(_) => "[B-OM-011]",
-            OrderMonitorErr::UnexpectedError(_) => "[B-OM-500]",
-        }
-    }
+/// Status of a persistent order as it moves through the lifecycle in the database.
+/// Orders in initial, intermediate, or terminal non-failure states (e.g. New, Pricing, Done, Skipped)
+/// are managed in-memory or removed from the database.
+#[derive(Clone, Copy, sqlx::Type, Debug, PartialEq, Serialize, Deserialize)]
+enum OrderStatus {
+    /// Order is ready to commence proving (either locked or filling without locking)
+    PendingProving,
+    /// Order is actively ready for proving
+    Proving,
+    /// Order is ready for aggregation
+    PendingAgg,
+    /// Order is in the process of Aggregation
+    Aggregating,
+    /// Unaggregated order is ready for submission
+    SkipAggregation,
+    /// Pending on chain finalization
+    PendingSubmission,
+    /// Order has been completed
+    Done,
+    /// Order failed
+    Failed,
+    /// Order was analyzed and marked as skipable
+    Skipped,
 }
 
-/// Represents the capacity for proving orders that we have available given our config.
-/// Also manages vending out capacity for proving, preventing too many proofs from being
-/// kicked off in each iteration.
-#[derive(Debug, PartialEq)]
-enum Capacity {
-    /// There are orders that have been picked for proving but not fulfilled yet.
-    /// Number indicates available slots.
-    Available(u32),
-    /// There is no concurrent lock limit.
-    Unlimited,
+#[derive(Clone, Copy, sqlx::Type, Debug, PartialEq, Serialize, Deserialize)]
+enum FulfillmentType {
+    LockAndFulfill,
+    FulfillAfterLockExpire,
+    // Currently not supported
+    FulfillWithoutLocking,
 }
 
-impl Capacity {
-    /// Returns the number of proofs we can kick off in the current iteration. Capped at
-    /// [MAX_PROVING_BATCH_SIZE] to limit number of proving tasks spawned at once.
-    fn request_capacity(&self, request: u32) -> u32 {
-        match self {
-            Capacity::Available(capacity) => {
-                if request > *capacity {
-                    std::cmp::min(*capacity, MAX_PROVING_BATCH_SIZE)
-                } else {
-                    std::cmp::min(request, MAX_PROVING_BATCH_SIZE)
-                }
-            }
-            Capacity::Unlimited => std::cmp::min(MAX_PROVING_BATCH_SIZE, request),
-        }
-    }
+/// Message sent from MarketMonitor to OrderPicker about order state changes
+#[derive(Debug, Clone)]
+pub enum OrderStateChange {
+    /// Order has been locked by a prover
+    Locked { request_id: U256, prover: Address },
+    /// Order has been fulfilled
+    Fulfilled { request_id: U256 },
 }
 
-struct OrderExpiry;
-
-impl<K: std::hash::Hash + Eq, V: std::borrow::Borrow<OrderRequest>> Expiry<K, V> for OrderExpiry {
-    fn expire_after_create(&self, _key: &K, value: &V, _now: Instant) -> Option<Duration> {
-        let order: &OrderRequest = value.borrow();
-        order.expire_timestamp.map(|t| {
-            let time_until_expiry = t.saturating_sub(now_timestamp());
-            Duration::from_secs(time_until_expiry)
-        })
-    }
+/// Helper function to format an order ID consistently
+fn format_order_id(
+    request_id: &U256,
+    signing_hash: &FixedBytes<32>,
+    fulfillment_type: &FulfillmentType,
+) -> String {
+    format!("0x{request_id:x}-{signing_hash}-{fulfillment_type:?}")
 }
 
-#[derive(Default)]
-struct OrderMonitorConfig {
-    min_deadline: u64,
-    peak_prove_khz: Option<u64>,
-    max_concurrent_proofs: Option<u32>,
-    additional_proof_cycles: u64,
-    batch_buffer_time_secs: u64,
-    order_commitment_priority: OrderCommitmentPriority,
-    priority_addresses: Option<Vec<Address>>,
+/// Order request from the network.
+///
+/// This will turn into an [`Order`] once it is locked or skipped.
+#[derive(Serialize, Deserialize, Debug)]
+struct OrderRequest {
+    request: ProofRequest,
+    client_sig: Bytes,
+    fulfillment_type: FulfillmentType,
+    boundless_market_address: Address,
+    chain_id: u64,
+    image_id: Option<String>,
+    input_id: Option<String>,
+    total_cycles: Option<u64>,
+    target_timestamp: Option<u64>,
+    expire_timestamp: Option<u64>,
 }
 
-#[derive(Clone)]
-pub struct RpcRetryConfig {
-    pub retry_count: u64,
-    pub retry_sleep_ms: u64,
-}
-
-#[derive(Clone)]
-pub struct OrderMonitor<P> {
-    db: DbObj,
-    chain_monitor: Arc<ChainMonitorService<P>>,
-    block_time: u64,
-    config: ConfigLock,
-    market: BoundlessMarketService<Arc<P>>,
-    provider: Arc<P>,
-    prover_addr: Address,
-    priced_order_rx: Arc<Mutex<mpsc::Receiver<Box<OrderRequest>>>>,
-    lock_and_prove_cache: Arc<Cache<String, Arc<OrderRequest>>>,
-    prove_cache: Arc<Cache<String, Arc<OrderRequest>>>,
-    supported_selectors: SupportedSelectors,
-    rpc_retry_config: RpcRetryConfig,
-}
-
-impl<P> OrderMonitor<P>
-where
-    P: Provider<Ethereum> + WalletProvider,
-{
-    #[allow(clippy::too_many_arguments)]
+impl OrderRequest {
     pub fn new(
-        db: DbObj,
-        provider: Arc<P>,
-        chain_monitor: Arc<ChainMonitorService<P>>,
-        config: ConfigLock,
-        block_time: u64,
-        prover_addr: Address,
-        market_addr: Address,
-        priced_orders_rx: mpsc::Receiver<Box<OrderRequest>>,
-        stake_token_decimals: u8,
-        rpc_retry_config: RpcRetryConfig,
-    ) -> Result<Self> {
-        let txn_timeout_opt = {
-            let config = config.lock_all().context("Failed to read config")?;
-            config.batcher.txn_timeout
+        request: ProofRequest,
+        client_sig: Bytes,
+        fulfillment_type: FulfillmentType,
+        boundless_market_address: Address,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            request,
+            client_sig,
+            fulfillment_type,
+            boundless_market_address,
+            chain_id,
+            image_id: None,
+            input_id: None,
+            total_cycles: None,
+            target_timestamp: None,
+            expire_timestamp: None,
+        }
+    }
+
+    // An Order is identified by the request_id, the fulfillment type, and the hash of the proof request.
+    // This structure supports multiple different ProofRequests with the same request_id, and different
+    // fulfillment types.
+    pub fn id(&self) -> String {
+        let signing_hash =
+            self.request.signing_hash(self.boundless_market_address, self.chain_id).unwrap();
+        format_order_id(&self.request.id, &signing_hash, &self.fulfillment_type)
+    }
+
+    fn to_order(&self, status: OrderStatus) -> Order {
+        Order {
+            boundless_market_address: self.boundless_market_address,
+            chain_id: self.chain_id,
+            fulfillment_type: self.fulfillment_type,
+            request: self.request.clone(),
+            status,
+            client_sig: self.client_sig.clone(),
+            updated_at: Utc::now(),
+            image_id: self.image_id.clone(),
+            input_id: self.input_id.clone(),
+            total_cycles: self.total_cycles,
+            target_timestamp: self.target_timestamp,
+            expire_timestamp: self.expire_timestamp,
+            proving_started_at: None,
+            proof_id: None,
+            compressed_proof_id: None,
+            lock_price: None,
+            error_msg: None,
+        }
+    }
+
+    fn to_skipped_order(&self) -> Order {
+        self.to_order(OrderStatus::Skipped)
+    }
+
+    fn to_proving_order(&self, lock_price: U256) -> Order {
+        let mut order = self.to_order(OrderStatus::PendingProving);
+        order.lock_price = Some(lock_price);
+        order.proving_started_at = Some(Utc::now().timestamp().try_into().unwrap());
+        order
+    }
+
+    /// Returns the relevant expiration timestamp for this order based on its fulfillment type.
+    /// - For LockAndFulfill orders: returns lock expiration
+    /// - For FulfillAfterLockExpire/FulfillWithoutLocking orders: returns order expiration
+    pub fn expiry(&self) -> u64 {
+        match self.fulfillment_type {
+            FulfillmentType::LockAndFulfill => self.request.lock_expires_at(),
+            FulfillmentType::FulfillAfterLockExpire => self.request.expires_at(),
+            FulfillmentType::FulfillWithoutLocking => self.request.expires_at(),
+        }
+    }
+}
+
+impl std::fmt::Display for OrderRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_mcycles = if self.total_cycles.is_some() {
+            format!(" ({} mcycles)", self.total_cycles.unwrap() / 1_000_000)
+        } else {
+            "".to_string()
         };
+        write!(f, "{}{} [{}]", self.id(), total_mcycles, format_expiries(&self.request))
+    }
+}
 
-        let mut market = BoundlessMarketService::new(
-            market_addr,
-            provider.clone(),
-            provider.default_signer_address(),
-        );
-        if let Some(txn_timeout) = txn_timeout_opt {
-            market = market.with_timeout(Duration::from_secs(txn_timeout));
-        }
-        {
-            let config = config.lock_all()?;
+/// An Order represents a proof request and a specific method of fulfillment.
+///
+/// Requests can be fulfilled in multiple ways, for example by locking then fulfilling them,
+/// by waiting for an existing lock to expire then fulfilling for slashed stake, or by fulfilling
+/// without locking at all.
+///
+/// For a given request, each type of fulfillment results in a separate Order being created, with different
+/// FulfillmentType values.
+///
+/// Additionally, there may be multiple requests with the same request_id, but different ProofRequest
+/// details. Those also result in separate Order objects being created.
+///
+/// See the id() method for more details on how Orders are identified.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Order {
+    /// Address of the boundless market contract. Stored as it is required to compute the order id.
+    boundless_market_address: Address,
+    /// Chain ID of the boundless market contract. Stored as it is required to compute the order id.
+    chain_id: u64,
+    /// Fulfillment type
+    fulfillment_type: FulfillmentType,
+    /// Proof request object
+    request: ProofRequest,
+    /// status of the order
+    status: OrderStatus,
+    /// Last update time
+    #[serde(with = "ts_seconds")]
+    updated_at: DateTime<Utc>,
+    /// Total cycles
+    /// Populated after initial pricing in order picker
+    total_cycles: Option<u64>,
+    /// Locking status target UNIX timestamp
+    target_timestamp: Option<u64>,
+    /// When proving was commenced at
+    proving_started_at: Option<u64>,
+    /// Prover image Id
+    ///
+    /// Populated after preflight
+    image_id: Option<String>,
+    /// Input Id
+    ///
+    ///  Populated after preflight
+    input_id: Option<String>,
+    /// Proof Id
+    ///
+    /// Populated after proof completion
+    proof_id: Option<String>,
+    /// Compressed proof Id
+    ///
+    /// Populated after proof completion. if the proof is compressed
+    compressed_proof_id: Option<String>,
+    /// UNIX timestamp the order expires at
+    ///
+    /// Populated during order picking
+    expire_timestamp: Option<u64>,
+    /// Client Signature
+    client_sig: Bytes,
+    /// Price the lockin was set at
+    lock_price: Option<U256>,
+    /// Failure message
+    error_msg: Option<String>,
+}
 
-            market = market.with_stake_balance_alert(
-                &config
-                    .market
-                    .stake_balance_warn_threshold
-                    .as_ref()
-                    .map(|s| parse_units(s, stake_token_decimals).unwrap().into()),
-                &config
-                    .market
-                    .stake_balance_error_threshold
-                    .as_ref()
-                    .map(|s| parse_units(s, stake_token_decimals).unwrap().into()),
-            );
-        }
-        let monitor = Self {
-            db,
-            chain_monitor,
-            block_time,
-            config,
-            market,
-            provider,
-            prover_addr,
-            priced_order_rx: Arc::new(Mutex::new(priced_orders_rx)),
-            lock_and_prove_cache: Arc::new(Cache::builder().expire_after(OrderExpiry).build()),
-            prove_cache: Arc::new(Cache::builder().expire_after(OrderExpiry).build()),
-            supported_selectors: SupportedSelectors::default(),
-            rpc_retry_config,
+impl Order {
+    // An Order is identified by the request_id, the fulfillment type, and the hash of the proof request.
+    // This structure supports multiple different ProofRequests with the same request_id, and different
+    // fulfillment types.
+    pub fn id(&self) -> String {
+        let signing_hash =
+            self.request.signing_hash(self.boundless_market_address, self.chain_id).unwrap();
+        format_order_id(&self.request.id, &signing_hash, &self.fulfillment_type)
+    }
+
+    pub fn is_groth16(&self) -> bool {
+        is_groth16_selector(self.request.requirements.selector)
+    }
+}
+
+impl std::fmt::Display for Order {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_mcycles = if self.total_cycles.is_some() {
+            format!(" ({} mcycles)", self.total_cycles.unwrap() / 1_000_000)
+        } else {
+            "".to_string()
         };
-        Ok(monitor)
+        write!(f, "{}{} [{}]", self.id(), total_mcycles, format_expiries(&self.request))
     }
+}
 
-    async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
-        let request_id = order.request.id;
-        // 无条件尝试：跳过链上/本地的预检查，直接尝试发起锁定交易
+#[derive(sqlx::Type, Default, Serialize, Deserialize, Debug, Clone, PartialEq)]
+enum BatchStatus {
+    #[default]
+    Aggregating,
+    PendingCompression,
+    Complete,
+    PendingSubmission,
+    Submitted,
+    Failed,
+}
 
-        let conf_priority_gas = {
-            let conf = self.config.lock_all().context("Failed to lock config")?;
-            conf.market.lockin_priority_gas
-        };
+#[derive(Serialize, Deserialize, Clone)]
+struct AggregationState {
+    pub guest_state: risc0_aggregation::GuestState,
+    /// All claim digests in this aggregation.
+    /// This collection can be used to construct the aggregation Merkle tree and Merkle paths.
+    pub claim_digests: Vec<Digest>,
+    /// Proof ID for the STARK proof that compresses the root of the aggregation tree.
+    pub proof_id: String,
+    /// Proof ID for the Groth16 proof that compresses the root of the aggregation tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groth16_proof_id: Option<String>,
+}
 
-        tracing::info!("🔐 正在锁定请求(无条件尝试): 0x{:x} 质押金额: {}", request_id, order.request.offer.lockStake);
-        let lock_block = self
-            .market
-            .lock_request(&order.request, order.client_sig.clone(), conf_priority_gas)
-            .await
-            .map_err(|e| -> OrderMonitorErr {
-                match e {
-                    MarketError::TxnError(txn_err) => match txn_err {
-                        TxnErr::BoundlessMarketErr(IBoundlessMarketErrors::RequestIsLocked(_)) => {
-                            OrderMonitorErr::AlreadyLocked
-                        }
-                        _ => OrderMonitorErr::LockTxFailed(txn_err.to_string()),
-                    },
-                    MarketError::RequestAlreadyLocked(_e) => OrderMonitorErr::AlreadyLocked,
-                    MarketError::TxnConfirmationError(e) => {
-                        OrderMonitorErr::LockTxNotConfirmed(e.to_string())
-                    }
-                    MarketError::LockRevert(e) => {
-                        // Note: lock revert could be for any number of reasons;
-                        // 1/ someone may have locked in the block before us,
-                        // 2/ the lock may have expired,
-                        // 3/ the request may have been fulfilled,
-                        // 4/ the requestor may have withdrawn their funds
-                        // Currently we don't have a way to determine the cause of the revert.
-                        OrderMonitorErr::LockTxFailed(format!("Tx hash 0x{e:x}"))
-                    }
-                    MarketError::Error(e) => {
-                        // Insufficient balance error is thrown both when the requestor has insufficient balance,
-                        // Requestor having insufficient balance can happen and is out of our control. The prover
-                        // having insufficient balance is unexpected as we should have checked for that before
-                        // committing to locking the order.
-                        let prover_addr_str =
-                            self.prover_addr.to_string().to_lowercase().replace("0x", "");
-                        if e.to_string().contains("InsufficientBalance") {
-                            if e.to_string().to_lowercase().contains(&prover_addr_str) {
-                                OrderMonitorErr::InsufficientBalance
-                            } else {
-                                OrderMonitorErr::LockTxFailed(format!(
-                                    "Requestor has insufficient balance at lock time: {e}"
-                                ))
-                            }
-                        } else if e.to_string().contains("RequestIsLocked") {
-                            OrderMonitorErr::AlreadyLocked
-                        } else {
-                            OrderMonitorErr::UnexpectedError(e)
-                        }
-                    }
-                    _ => {
-                        if e.to_string().contains("RequestIsLocked") {
-                            OrderMonitorErr::AlreadyLocked
-                        } else {
-                            OrderMonitorErr::UnexpectedError(e.into())
-                        }
-                    }
-                }
-            })?;
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Batch {
+    pub status: BatchStatus,
+    /// Orders from the market that are included in this batch.
+    pub orders: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessor_proof_id: Option<String>,
+    /// Tuple of the current aggregation state, as committed by the set builder guest, and the
+    /// proof ID for the receipt that attests to the correctness of this state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregation_state: Option<AggregationState>,
+    /// When the batch was initially created.
+    pub start_time: DateTime<Utc>,
+    /// The deadline for the batch, which is the earliest deadline for any order in the batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<u64>,
+    /// The total fees for the batch, which is the sum of fees from all orders.
+    pub fees: U256,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_msg: Option<String>,
+}
 
-        // Fetch the block to retrieve the lock timestamp. This has been observed to return
-        // inconsistent state between the receipt being available but the block not yet.
-        let lock_timestamp = crate::futures_retry::retry(
-            self.rpc_retry_config.retry_count,
-            self.rpc_retry_config.retry_sleep_ms,
-            || async {
-                Ok(self
-                    .provider
-                    .get_block_by_number(lock_block.into())
-                    .await
-                    .with_context(|| format!("failed to get block {lock_block}"))?
-                    .with_context(|| format!("failed to get block {lock_block}: block not found"))?
-                    .header
-                    .timestamp)
-            },
-            "get_block_by_number",
-        )
-        .await
-        .map_err(OrderMonitorErr::UnexpectedError)?;
+pub struct Broker<P> {
+    args: Args,
+    provider: Arc<P>,
+    db: DbObj,
+    config_watcher: ConfigWatcher,
+}
 
-        let lock_price = order
-            .request
-            .offer
-            .price_at(lock_timestamp)
-            .context("Failed to calculate lock price")?;
+impl<P> Broker<P>
+where
+    P: Provider<Ethereum> + 'static + Clone + WalletProvider,
+{
+    pub async fn new(mut args: Args, provider: P) -> Result<Self> {
+        let config_watcher =
+            ConfigWatcher::new(&args.config_file).await.context("Failed to load broker config")?;
 
-        Ok(lock_price)
-    }
+        let db: DbObj =
+            Arc::new(SqliteDb::new(&args.db_url).await.context("Failed to connect to sqlite DB")?);
 
-    async fn get_proving_order_capacity(
-        &self,
-        max_concurrent_proofs: Option<u32>,
-        prev_orders_by_status: &mut String,
-    ) -> Result<Capacity, OrderMonitorErr> {
-        if max_concurrent_proofs.is_none() {
-            return Ok(Capacity::Unlimited);
-        };
+        let chain_id = provider.get_chain_id().await.context("Failed to get chain ID")?;
 
-        let max = max_concurrent_proofs.unwrap();
-        let committed_orders = self
-            .db
-            .get_committed_orders()
-            .await
-            .map_err(|e| OrderMonitorErr::UnexpectedError(e.into()))?;
-        let committed_orders_count: u32 = committed_orders.len().try_into().unwrap();
-
-        Self::log_capacity(prev_orders_by_status, committed_orders, max).await;
-
-        let available_slots = max.saturating_sub(committed_orders_count);
-        Ok(Capacity::Available(available_slots))
-    }
-
-    async fn log_capacity(
-        prev_orders_by_status: &mut String,
-        commited_orders: Vec<Order>,
-        max: u32,
-    ) {
-        let committed_orders_count: u32 = commited_orders.len().try_into().unwrap();
-        let request_id_and_status = commited_orders
-            .iter()
-            .map(|order| format!("[{:?}]: {order}", order.status))
-            .collect::<Vec<_>>();
-
-        let capacity_log = format!("Current num committed orders: {committed_orders_count}. Maximum commitment: {max}. Committed orders: {request_id_and_status:?}");
-
-        // Note: we don't compare previous to capacity_log as it contains timestamps which cause it to always change.
-        // We only want to log if status or num orders changes.
-        let cur_orders_by_status = commited_orders
-            .iter()
-            .map(|order| format!("{:?}-{}", order.status, order.id()))
-            .collect::<Vec<_>>()
-            .join(",");
-        if *prev_orders_by_status != cur_orders_by_status {
-            tracing::info!("{}", capacity_log);
-            *prev_orders_by_status = cur_orders_by_status;
-        }
-    }
-
-    /// Helper method to skip an order in the database and invalidate the appropriate cache
-    async fn skip_order(&self, order: &OrderRequest, reason: &str) {
-        if let Err(e) = self.db.insert_skipped_request(order).await {
-            tracing::error!("Failed to skip order ({}): {} - {e:?}", reason, order.id());
-        }
-
-        match order.fulfillment_type {
-            FulfillmentType::LockAndFulfill => {
-                self.lock_and_prove_cache.invalidate(&order.id()).await;
-            }
-            FulfillmentType::FulfillAfterLockExpire | FulfillmentType::FulfillWithoutLocking => {
-                self.prove_cache.invalidate(&order.id()).await;
-            }
-        }
-    }
-
-    async fn get_valid_orders(
-        &self,
-        current_block_timestamp: u64,
-        min_deadline: u64,
-    ) -> Result<Vec<Arc<OrderRequest>>> {
-        let mut candidate_orders: Vec<Arc<OrderRequest>> = Vec::new();
-
-        fn is_within_deadline(
-            order: &OrderRequest,
-            current_block_timestamp: u64,
-            min_deadline: u64,
-        ) -> bool {
-            let expiration = order.expiry();
-            if expiration < current_block_timestamp {
-                tracing::debug!("Request {:x} has now expired. Skipping.", order.request.id);
-                false
-            } else if expiration.saturating_sub(now_timestamp()) < min_deadline {
-                tracing::debug!("Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.", order.request.id, expiration, min_deadline);
-                false
+        // Resolve deployment configuration if not provided, or validate if provided
+        if let Some(manual_deployment) = &args.deployment {
+            // Check if there's a default deployment for this chain ID
+            if let Some(expected_deployment) = Deployment::from_chain_id(chain_id) {
+                Self::validate_deployment_config(manual_deployment, &expected_deployment, chain_id);
             } else {
-                true
+                tracing::info!("Using manually configured deployment for chain ID {chain_id} (no default available)");
             }
+        } else {
+            args.deployment = Some(Deployment::from_chain_id(chain_id)
+                .with_context(|| format!("No default deployment found for chain ID {chain_id}. Please specify deployment configuration manually."))?);
+            tracing::info!("Using default deployment configuration for chain ID {chain_id}");
         }
 
-        fn is_target_time_reached(order: &OrderRequest, current_block_timestamp: u64) -> bool {
-            // OPTIMIZATION: LockAndFulfill orders bypass target timestamp checks for maximum speed
-            if order.fulfillment_type == FulfillmentType::LockAndFulfill {
-                tracing::trace!(
-                    "⚡ 速度优化: LockAndFulfill订单 {:x} 绕过目标时间戳检查",
-                    order.request.id
-                );
-                return true;
-            }
-
-            // Note: this could use current timestamp, but avoiding cases where clock has drifted.
-            match order.target_timestamp {
-                Some(target_timestamp) => {
-                    if current_block_timestamp < target_timestamp {
-                        tracing::trace!(
-                            "Request {:x} target timestamp {} not yet reached (current: {}). Waiting.",
-                            order.request.id,
-                            target_timestamp,
-                            current_block_timestamp
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                }
-                None => {
-                    // Should not happen, just warning for safety as this condition is not strictly
-                    // enforced at compile time.
-                    tracing::warn!("Request {:x} has no target timestamp set", order.request.id);
-                    false
-                }
-            }
-        }
-
-        for (_, order) in self.prove_cache.iter() {
-            let is_fulfilled = self
-                .db
-                .is_request_fulfilled(U256::from(order.request.id))
-                .await
-                .context("Failed to check if request is fulfilled")?;
-            if is_fulfilled {
-                tracing::debug!(
-                    "Request 0x{:x} was locked by another prover and was fulfilled. Skipping.",
-                    order.request.id
-                );
-                self.skip_order(&order, "was fulfilled by other").await;
-            } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
-                self.skip_order(&order, "expired").await;
-            } else if is_target_time_reached(&order, current_block_timestamp) {
-                tracing::info!("Request 0x{:x} was locked by another prover but expired unfulfilled, setting status to pending proving", order.request.id);
-                candidate_orders.push(order);
-            }
-        }
-
-        for (_, order) in self.lock_and_prove_cache.iter() {
-            let is_lock_expired = order.request.lock_expires_at() < current_block_timestamp;
-            if is_lock_expired {
-                tracing::debug!("Request {:x} was scheduled to be locked by us, but its lock has now expired. Skipping.", order.request.id);
-                self.skip_order(&order, "lock expired before we locked").await;
-            } else if let Some((locker, _)) =
-                self.db.get_request_locked(U256::from(order.request.id)).await?
-            {
-                let our_address = self.provider.default_signer_address().to_string().to_lowercase();
-                let locker_address = locker.to_lowercase();
-                // Compare normalized addresses (lowercase without 0x prefix)
-                let our_address_normalized = our_address.trim_start_matches("0x");
-                let locker_address_normalized = locker_address.trim_start_matches("0x");
-
-                if locker_address_normalized != our_address_normalized {
-                    tracing::debug!("Request 0x{:x} was scheduled to be locked by us ({}), but is already locked by another prover ({}). Skipping.", order.request.id, our_address, locker_address);
-                    self.skip_order(&order, "locked by another prover").await;
-                } else {
-                    // Edge case where we locked the order, but due to some reason was not moved to proving state. Should not happen.
-                    tracing::debug!("Request 0x{:x} was scheduled to be locked by us, but is already locked by us. Proceeding to prove.", order.request.id);
-                    candidate_orders.push(order);
-                }
-            } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
-                self.skip_order(&order, "insufficient deadline").await;
-            } else if is_target_time_reached(&order, current_block_timestamp) {
-                candidate_orders.push(order);
-            }
-        }
-
-        if candidate_orders.is_empty() {
-            tracing::trace!(
-                "No orders to lock and/or prove as of block timestamp {}",
-                current_block_timestamp
-            );
-            return Ok(Vec::new());
-        }
-
-        tracing::debug!(
-            "Valid orders that reached target timestamp; ready for locking/proving, num: {}, ids: {}",
-            candidate_orders.len(),
-            candidate_orders.iter().map(|order| order.id()).collect::<Vec<_>>().join(", ")
-        );
-
-        Ok(candidate_orders)
+        Ok(Self { args, db, provider: Arc::new(provider), config_watcher })
     }
 
-    async fn lock_and_prove_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<()> {
-        let lock_jobs = orders.iter().map(|order| {
-            async move {
-                let order_id = order.id();
-                if order.fulfillment_type == FulfillmentType::LockAndFulfill {
-                    // 仅锁定由指定请求方地址发出的订单
-                    let allow_addr = Address::from_str("0xc2db89b2bd434ceac6c74fbc0b2ad3a280e66db0")
-                        .expect("invalid allow address literal");
-                    let requestor_addr = RequestId::from_lossy(U256::from(order.request.id)).addr;
-                    if requestor_addr != allow_addr {
-                        tracing::debug!(
-                            "忽略非白名单请求方订单: {} (requestor: {}, allow: {})",
-                            order_id,
-                            requestor_addr,
-                            allow_addr
-                        );
-                        return;
-                    }
-                    let request_id = order.request.id;
-                    match self.lock_order(order).await {
-                        Ok(lock_price) => {
-                            tracing::info!("🔒 成功锁定请求: 0x{:x}", request_id);
-                            if let Err(err) = self.db.insert_accepted_request(order, lock_price).await {
-                                tracing::error!(
-                                    "FATAL STAKE AT RISK: {} failed to move from locking -> proving status {}",
-                                    order_id,
-                                    err
-                                );
-                            }
-                        }
-                        Err(ref err) => {
-                            match err {
-                                OrderMonitorErr::UnexpectedError(inner) => {
-                                                                    tracing::error!(
-                                    "❌ 锁定订单失败: {order_id} - {} - {inner:?}",
-                                    err.code()
-                                );
-                                }
-                                OrderMonitorErr::AlreadyLocked => {
-                                    // For order already locked, we don't need to print the error backtrace.
-                                    tracing::warn!("⚠️ 订单锁定失败 (已被锁定): {order_id} - {}", err.code());
-                                }
-                                _ => {
-                                    tracing::warn!(
-                                        "⚠️ 锁定请求失败: {order_id} - {} - {err:?}",
-                                        err.code()
-                                    );
-                                }
-                            }
-                            if let Err(err) = self.db.insert_skipped_request(order).await {
-                                tracing::error!(
-                                    "Failed to set DB failure state for order: {order_id} - {err:?}"
-                                );
-                            }
-                        }
-                    }
-                    self.lock_and_prove_cache.invalidate(&order_id).await;
-                } else {
-                    if let Err(err) = self.db.insert_accepted_request(order, U256::ZERO).await {
-                        tracing::error!(
-                            "Failed to set order status to pending proving: {} - {err:?}",
-                            order_id
-                        );
-                    }
-                    self.prove_cache.invalidate(&order_id).await;
-                }
+    pub fn deployment(&self) -> &Deployment {
+        self.args.deployment.as_ref().unwrap()
+    }
+
+    fn validate_deployment_config(manual: &Deployment, expected: &Deployment, chain_id: u64) {
+        let mut warnings = Vec::new();
+
+        if manual.boundless_market_address != expected.boundless_market_address {
+            warnings.push(format!(
+                "boundless_market_address mismatch: configured={}, expected={}",
+                manual.boundless_market_address, expected.boundless_market_address
+            ));
+        }
+
+        if manual.set_verifier_address != expected.set_verifier_address {
+            warnings.push(format!(
+                "set_verifier_address mismatch: configured={}, expected={}",
+                manual.set_verifier_address, expected.set_verifier_address
+            ));
+        }
+
+        if let (Some(manual_addr), Some(expected_addr)) =
+            (manual.verifier_router_address, expected.verifier_router_address)
+        {
+            if manual_addr != expected_addr {
+                warnings.push(format!(
+                    "verifier_router_address mismatch: configured={manual_addr}, expected={expected_addr}"
+                ));
             }
+        }
+
+        if let (Some(manual_addr), Some(expected_addr)) =
+            (manual.stake_token_address, expected.stake_token_address)
+        {
+            if manual_addr != expected_addr {
+                warnings.push(format!(
+                    "stake_token_address mismatch: configured={manual_addr}, expected={expected_addr}"
+                ));
+            }
+        }
+
+        if manual.order_stream_url != expected.order_stream_url {
+            warnings.push(format!(
+                "order_stream_url mismatch: configured={:?}, expected={:?}",
+                manual.order_stream_url, expected.order_stream_url
+            ));
+        }
+
+        if let (Some(chain_id), Some(expected_chain_id)) = (manual.chain_id, expected.chain_id) {
+            if chain_id != expected_chain_id {
+                warnings.push(format!(
+                    "chain_id mismatch: configured={chain_id}, expected={expected_chain_id}"
+                ));
+            }
+        }
+
+        if warnings.is_empty() {
+            tracing::info!(
+                "Manual deployment configuration matches expected defaults for chain ID {chain_id}"
+            );
+        } else {
+            tracing::warn!(
+                "Manual deployment configuration differs from expected defaults for chain ID {chain_id}: {}",
+                warnings.join(", ")
+            );
+            tracing::warn!("This may indicate a configuration error. Please verify your deployment addresses are correct.");
+        }
+    }
+
+    async fn fetch_and_upload_set_builder_image(&self, prover: &ProverObj) -> Result<Digest> {
+        let set_verifier_contract = SetVerifierService::new(
+            self.deployment().set_verifier_address,
+            self.provider.clone(),
+            Address::ZERO,
+        );
+
+        let (image_id, image_url_str) = set_verifier_contract
+            .image_info()
+            .await
+            .context("Failed to get set builder image_info")?;
+        let image_id = Digest::from_bytes(image_id.0);
+        let path = {
+            let config = self.config_watcher.config.lock_all().context("Failed to lock config")?;
+            config.prover.set_builder_guest_path.clone()
+        };
+
+        tracing::debug!("Uploading set builder image: {}", image_url_str);
+        self.fetch_and_upload_image(prover, image_id, image_url_str, path)
+            .await
+            .context("uploading set builder image")?;
+        Ok(image_id)
+    }
+
+    async fn fetch_and_upload_assessor_image(&self, prover: &ProverObj) -> Result<Digest> {
+        let boundless_market = BoundlessMarketService::new(
+            self.deployment().boundless_market_address,
+            self.provider.clone(),
+            Address::ZERO,
+        );
+        let (image_id, image_url_str) =
+            boundless_market.image_info().await.context("Failed to get assessor image_info")?;
+        let image_id = Digest::from_bytes(image_id.0);
+
+        let path = {
+            let config = self.config_watcher.config.lock_all().context("Failed to lock config")?;
+            config.prover.assessor_set_guest_path.clone()
+        };
+
+        tracing::debug!("Uploading assessor image: {}", image_url_str);
+        self.fetch_and_upload_image(prover, image_id, image_url_str, path)
+            .await
+            .context("uploading assessor image")?;
+        Ok(image_id)
+    }
+
+    async fn fetch_and_upload_image(
+        &self,
+        prover: &ProverObj,
+        image_id: Digest,
+        image_url_str: String,
+        program_path: Option<PathBuf>,
+    ) -> Result<()> {
+        if prover.has_image(&image_id.to_string()).await? {
+            tracing::debug!("Image for {} already uploaded, skipping pull", image_id);
+            return Ok(());
+        }
+
+        let program_bytes = if let Some(path) = program_path {
+            let file_program_buf =
+                tokio::fs::read(&path).await.context("Failed to read program file")?;
+            let file_img_id = risc0_zkvm::compute_image_id(&file_program_buf)
+                .context("Failed to compute imageId")?;
+
+            if image_id != file_img_id {
+                anyhow::bail!(
+                    "Image ID mismatch for {}, expected {}, got {}",
+                    path.display(),
+                    image_id,
+                    file_img_id.to_string()
+                );
+            }
+
+            file_program_buf
+        } else {
+            let image_uri = create_uri_handler(&image_url_str, &self.config_watcher.config, false)
+                .await
+                .context("Failed to parse image URI")?;
+            tracing::debug!("Downloading image from: {image_uri}");
+
+            image_uri.fetch().await.context("Failed to download image")?
+        };
+
+        prover
+            .upload_image(&image_id.to_string(), program_bytes)
+            .await
+            .context("Failed to upload image to prover")?;
+        Ok(())
+    }
+
+    pub async fn start_service(&self) -> Result<()> {
+        let mut supervisor_tasks: JoinSet<Result<()>> = JoinSet::new();
+
+        let config = self.config_watcher.config.clone();
+
+        let loopback_blocks = {
+            let config = match config.lock_all() {
+                Ok(res) => res,
+                Err(err) => anyhow::bail!("Failed to lock config in watcher: {err:?}"),
+            };
+            config.market.lookback_blocks
+        };
+
+        // Create two cancellation tokens for graceful shutdown:
+        // 1. Non-critical tasks (order discovery, picking, monitoring) - cancelled immediately on shutdown signal
+        // 2. Critical tasks (proving, aggregation, submission) - cancelled only after committed orders complete
+        let non_critical_cancel_token = CancellationToken::new();
+        let critical_cancel_token = CancellationToken::new();
+
+        let chain_monitor = Arc::new(
+            chain_monitor::ChainMonitorService::new(self.provider.clone())
+                .await
+                .context("Failed to initialize chain monitor")?,
+        );
+
+        let cloned_chain_monitor = chain_monitor.clone();
+        let cloned_config = config.clone();
+        // Critical task, as is relied on to query current chain state
+        let cancel_token = critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(cloned_chain_monitor, cloned_config, cancel_token)
+                .spawn()
+                .await
+                .context("Failed to start chain monitor")?;
+            Ok(())
         });
 
-        futures::future::join_all(lock_jobs).await;
+        let chain_id = self.provider.get_chain_id().await.context("Failed to get chain ID")?;
+        let client = self
+            .deployment()
+            .order_stream_url
+            .clone()
+            .map(|url| -> Result<OrderStreamClient> {
+                let url = Url::parse(&url).context("Failed to parse order stream URL")?;
+                Ok(OrderStreamClient::new(
+                    url,
+                    self.deployment().boundless_market_address,
+                    chain_id,
+                ))
+            })
+            .transpose()?;
 
-        Ok(())
-    }
+        // Create a channel for new orders to be sent to the OrderPicker / from monitors
+        let (new_order_tx, new_order_rx) = mpsc::channel(NEW_ORDER_CHANNEL_CAPACITY);
 
-    /// Calculate the gas units needed for an order and the corresponding cost in wei
-    async fn calculate_order_gas_cost_wei(
-        &self,
-        order: &OrderRequest,
-        gas_price: u128,
-    ) -> Result<U256, OrderMonitorErr> {
-        // Calculate gas units needed for this order (lock + fulfill)
-        let order_gas_units = if order.fulfillment_type == FulfillmentType::LockAndFulfill {
-            U256::from(utils::estimate_gas_to_lock(&self.config, order).await?).saturating_add(
-                U256::from(
-                    utils::estimate_gas_to_fulfill(
-                        &self.config,
-                        &self.supported_selectors,
-                        &order.request,
-                    )
-                    .await?,
-                ),
+        // Create a broadcast channel for order state change messages
+        let (order_state_tx, _) = tokio::sync::broadcast::channel(ORDER_STATE_CHANNEL_CAPACITY);
+
+        // spin up a supervisor for the market monitor
+        let market_monitor = Arc::new(market_monitor::MarketMonitor::new(
+            loopback_blocks,
+            self.deployment().boundless_market_address,
+            self.provider.clone(),
+            self.db.clone(),
+            chain_monitor.clone(),
+            self.args.private_key.address(),
+            client.clone(),
+            new_order_tx.clone(),
+            order_state_tx.clone(),
+        ));
+
+        // OPTIMIZATION: Use 1ms interval for maximum speed instead of actual block times
+        let block_times = 1; // 1 second divided by 1000 = 1ms interval in practice
+        tracing::debug!("🚀 速度优化: 使用加速处理间隔: {block_times}毫秒等效");
+        // Original: market_monitor.get_block_time().await.context("Failed to sample block times")?;
+
+        let cloned_config = config.clone();
+        let cancel_token = non_critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(market_monitor, cloned_config, cancel_token)
+                .spawn()
+                .await
+                .context("Failed to start market monitor")?;
+            Ok(())
+        });
+
+        // spin up a supervisor for the offchain market monitor
+        if let Some(client_clone) = client {
+            let offchain_market_monitor =
+                Arc::new(offchain_market_monitor::OffchainMarketMonitor::new(
+                    client_clone,
+                    self.args.private_key.clone(),
+                    new_order_tx.clone(),
+                ));
+            let cloned_config = config.clone();
+            let cancel_token = non_critical_cancel_token.clone();
+            supervisor_tasks.spawn(async move {
+                Supervisor::new(offchain_market_monitor, cloned_config, cancel_token)
+                    .spawn()
+                    .await
+                    .context("Failed to start offchain market monitor")?;
+                Ok(())
+            });
+        }
+
+        // Construct the prover object interface
+        let prover: provers::ProverObj = if is_dev_mode() {
+            tracing::warn!("WARNING: Running the Broker in dev mode does not generate valid receipts. \
+            Receipts generated from this process are invalid and should never be used in production.");
+            Arc::new(provers::DefaultProver::new())
+        } else if let (Some(bonsai_api_key), Some(bonsai_api_url)) =
+            (self.args.bonsai_api_key.as_ref(), self.args.bonsai_api_url.as_ref())
+        {
+            tracing::info!("Configured to run with Bonsai backend");
+            Arc::new(
+                provers::Bonsai::new(config.clone(), bonsai_api_url.as_ref(), bonsai_api_key)
+                    .context("Failed to construct Bonsai client")?,
+            )
+        } else if let Some(bento_api_url) = self.args.bento_api_url.as_ref() {
+            tracing::info!("Configured to run with Bento backend");
+
+            Arc::new(
+                provers::Bonsai::new(config.clone(), bento_api_url.as_ref(), "")
+                    .context("Failed to initialize Bento client")?,
             )
         } else {
-            U256::from(
-                utils::estimate_gas_to_fulfill(
-                    &self.config,
-                    &self.supported_selectors,
-                    &order.request,
-                )
-                .await?,
-            )
+            Arc::new(provers::DefaultProver::new())
         };
 
-        let order_cost_wei = U256::from(gas_price) * order_gas_units;
+        let (pricing_tx, pricing_rx) = mpsc::channel(PRICING_CHANNEL_CAPACITY);
 
-        Ok(order_cost_wei)
-    }
+        let stake_token_decimals = BoundlessMarketService::new(
+            self.deployment().boundless_market_address,
+            self.provider.clone(),
+            Address::ZERO,
+        )
+        .stake_token_decimals()
+        .await
+        .context("Failed to get stake token decimals. Possible RPC error.")?;
 
-    async fn apply_capacity_limits(
-        &self,
-        orders: Vec<Arc<OrderRequest>>,
-        config: &OrderMonitorConfig,
-        prev_orders_by_status: &mut String,
-    ) -> Result<Vec<Arc<OrderRequest>>> {
-        let num_orders = orders.len();
-        // Get our current capacity for proving orders given our config and the number of orders that are currently committed to be proven + fulfilled.
-        let capacity = self
-            .get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
-            .await?;
-        let capacity_granted: usize = capacity
-            .request_capacity(num_orders.try_into().expect("Failed to convert order count to u32"))
-            as usize;
+        // Spin up the order picker to pre-flight and find orders to lock
+        let order_picker = Arc::new(order_monitor::OrderMonitor::new(
+            self.db.clone(),
+            config.clone(),
+            prover.clone(),
+            self.deployment().boundless_market_address,
+            self.provider.clone(),
+            chain_monitor.clone(),
+            new_order_rx,
+            pricing_tx,
+            stake_token_decimals,
+            order_state_tx.clone(),
+        ));
+        let cloned_config = config.clone();
+        let cancel_token = non_critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(order_picker, cloned_config, cancel_token)
+                .spawn()
+                .await
+                .context("Failed to start order picker")?;
+            Ok(())
+        });
 
-        tracing::info!(
-            "Num orders ready for locking and/or proving: {}. Total capacity available: {capacity:?}, Capacity granted: {capacity_granted:?}",
-            num_orders
-        );
-
-        let mut final_orders: Vec<Arc<OrderRequest>> = Vec::with_capacity(capacity_granted);
-
-        // Get current gas price and available balance
-        // OPTIMIZATION: Use hardcoded gas price to avoid RPC calls
-        let gas_price = 2_000_000_000u128; // 2 gwei - ultra low cost competitive pricing
-        // Original: self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
-        let available_balance_wei = self
-            .provider
-            .get_balance(self.provider.default_signer_address())
+        let proving_service = Arc::new(
+            proving::ProvingService::new(
+                self.db.clone(),
+                prover.clone(),
+                config.clone(),
+                order_state_tx.clone(),
+            )
             .await
-            .map_err(|err| OrderMonitorErr::RpcErr(err.into()))?;
-
-        // Calculate gas units required for committed orders
-        let committed_orders = self.db.get_committed_orders().await?;
-        let committed_gas_units =
-            futures::future::try_join_all(committed_orders.iter().map(|order| {
-                utils::estimate_gas_to_fulfill(
-                    &self.config,
-                    &self.supported_selectors,
-                    &order.request,
-                )
-            }))
-            .await?
-            .iter()
-            .sum::<u64>();
-
-        // Calculate cost in wei
-        let committed_cost_wei = U256::from(gas_price) * U256::from(committed_gas_units);
-
-        // Log committed order gas requirements
-        if !committed_orders.is_empty() {
-            tracing::debug!(
-                "Cost for {} committed orders: {} ether",
-                committed_orders.len(),
-                format_ether(committed_cost_wei),
-            );
-        }
-
-        // Ensure we have enough for committed orders
-        if committed_cost_wei > available_balance_wei {
-            tracing::error!(
-                "Insufficient balance for committed orders. Required: {} ether, Available: {} ether",
-                format_ether(committed_cost_wei),
-                format_ether(available_balance_wei)
-            );
-            return Ok(Vec::new());
-        }
-
-        // Calculate remaining balance after accounting for committed orders
-        let mut remaining_balance_wei = available_balance_wei - committed_cost_wei;
-
-        // Apply peak khz limit if specified
-        let num_commited_orders = committed_orders.len();
-        if config.peak_prove_khz.is_some() && !orders.is_empty() {
-            let peak_prove_khz = config.peak_prove_khz.unwrap();
-            let total_commited_cycles = committed_orders
-                .iter()
-                .map(|order| order.total_cycles.unwrap() + config.additional_proof_cycles)
-                .sum::<u64>();
-
-            let now = now_timestamp();
-            // Estimate the time the prover will be available given our current committed orders.
-            let started_proving_at = committed_orders
-                .iter()
-                .map(|order| order.proving_started_at.unwrap())
-                .min()
-                .unwrap_or(now);
-
-            let proof_time_seconds = total_commited_cycles.div_ceil(1_000).div_ceil(peak_prove_khz);
-            let mut prover_available_at = started_proving_at + proof_time_seconds;
-            if prover_available_at < now {
-                let seconds_behind = now - prover_available_at;
-                tracing::warn!("Proofs are behind what is estimated from peak_prove_khz config by {} seconds. Consider lowering this value to avoid overlocking orders.", seconds_behind);
-                prover_available_at = now;
-            }
-            tracing::debug!("Already committed to {} orders, with a total cycle count of {}, a peak khz limit of {}, started working on them at {}, we estimate the prover will be available in {} seconds", 
-                num_commited_orders,
-                total_commited_cycles,
-                peak_prove_khz,
-                started_proving_at,
-                prover_available_at.saturating_sub(now),
-            );
-
-            // For each order in consideration, check if it can be completed before its expiration
-            // and that there is enough gas to pay for the lock and fulfillment of all orders
-            // including the committed orders.
-            for order in orders {
-                if final_orders.len() >= capacity_granted {
-                    break;
-                }
-                // Calculate gas and cost for this order using our helper method
-                let order_cost_wei = self.calculate_order_gas_cost_wei(&order, gas_price).await?;
-
-                // Skip if not enough balance
-                if order_cost_wei > remaining_balance_wei {
-                    tracing::warn!(
-                        "Insufficient balance for order {}. Required: {} ether, Remaining: {} ether",
-                        order.id(),
-                        format_ether(order_cost_wei),
-                        format_ether(remaining_balance_wei)
-                    );
-                    self.skip_order(&order, "insufficient balance").await;
-                    continue;
-                }
-
-                let Some(order_cycles) = order.total_cycles else {
-                    tracing::warn!("Order 0x{:x} has no total cycles, preflight was skipped? Not considering for peak khz limit", order.request.id);
-                    final_orders.push(order);
-                    remaining_balance_wei -= order_cost_wei;
-                    continue;
-                };
-
-                // Calculate total cycles including application proof, assessor, and set builder estimates
-                let total_cycles = order_cycles + config.additional_proof_cycles;
-
-                // OPTIMIZATION: Use aggressive time estimation for LockAndFulfill orders
-                let proof_time_seconds = if order.fulfillment_type == FulfillmentType::LockAndFulfill {
-                    // Use 10x faster estimation for LockAndFulfill to be more competitive
-                    let aggressive_time = total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz * 10);
-                    tracing::debug!(
-                        "⚡ 速度优化: LockAndFulfill订单 {:x} 使用激进时间估算: {}秒 (原估算: {}秒)",
-                        order.request.id,
-                        aggressive_time,
-                        total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz)
-                    );
-                    aggressive_time
-                } else {
-                    total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz)
-                };
-                let completion_time = prover_available_at + proof_time_seconds;
-                let expiration = order.expiry();
-
-                if completion_time + config.batch_buffer_time_secs > expiration {
-                    // If the order cannot be completed before its expiration, skip it permanently.
-                    // Otherwise, we keep the order for the next iteration as capacity may free up in the future.
-
-                    if now + proof_time_seconds > expiration {
-                        tracing::info!("Order 0x{:x} cannot be completed before its expiration at {}, proof estimated to take {} seconds and complete at {}. Skipping", 
-                            order.request.id,
-                            expiration,
-                            proof_time_seconds,
-                            completion_time
-                        );
-                        // If the order cannot be completed regardless of other orders, skip it
-                        // permanently. Otherwise, will retry including the order.
-                        self.skip_order(&order, "cannot be completed before expiration").await;
-                    } else {
-                        tracing::debug!("Given current commited orders and capacity, order 0x{:x} cannot be completed before its expiration. Not skipping as capacity may free up before it expires.", order.request.id);
-                    }
-                    continue;
-                }
-
-                tracing::debug!("Order {} estimated to take {} seconds (including assessor + set builder), and would be completed at {} ({} seconds from now). It expires at {} ({} seconds from now)", order.id(), proof_time_seconds, completion_time, completion_time.saturating_sub(now_timestamp()), expiration, expiration.saturating_sub(now_timestamp()));
-
-                final_orders.push(order);
-                prover_available_at = completion_time;
-                remaining_balance_wei -= order_cost_wei;
-            }
-        } else {
-            // If no peak khz limit, just check gas for each order
-            for order in orders {
-                if final_orders.len() >= capacity_granted {
-                    break;
-                }
-                let order_cost_wei = self.calculate_order_gas_cost_wei(&order, gas_price).await?;
-
-                // Skip if not enough balance
-                if order_cost_wei > remaining_balance_wei {
-                    tracing::warn!(
-                        "Insufficient balance for order {}. Required: {} ether, Remaining: {} ether",
-                        order.id(),
-                        format_ether(order_cost_wei),
-                        format_ether(remaining_balance_wei)
-                    );
-                    self.skip_order(&order, "insufficient balance").await;
-                    continue;
-                }
-
-                final_orders.push(order);
-                remaining_balance_wei -= order_cost_wei;
-            }
-        }
-
-        tracing::info!(
-            "Started with {} orders ready to be locked and/or proven. Already commited to {} orders. After applying capacity limits of {} max concurrent proofs and {} peak khz, filtered to {} orders: {:?}",
-            num_orders,
-            num_commited_orders,
-            if let Some(max_concurrent_proofs) = config.max_concurrent_proofs {
-                max_concurrent_proofs.to_string()
-            } else {
-                "unlimited".to_string()
-            },
-            if let Some(peak_prove_khz) = config.peak_prove_khz {
-                peak_prove_khz.to_string()
-            } else {
-                "unlimited".to_string()
-            },
-            final_orders.len(),
-            final_orders.iter().map(|order| order.id()).collect::<Vec<_>>()
+            .context("Failed to initialize proving service")?,
         );
 
-        Ok(final_orders)
-    }
+        let cloned_config = config.clone();
+        let cancel_token = critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(proving_service, cloned_config, cancel_token)
+                .spawn()
+                .await
+                .context("Failed to start proving service")?;
+            Ok(())
+        });
 
-    pub async fn start_monitor(
-        self,
-        cancel_token: CancellationToken,
-    ) -> Result<(), OrderMonitorErr> {
-        let mut last_block = 0;
-        let mut first_block = 0;
-        // OPTIMIZATION: Use 1ms interval for maximum order processing speed
-        let mut interval = tokio::time::interval_at(
-            tokio::time::Instant::now(),
-            tokio::time::Duration::from_millis(1),
+        let prover_addr = self.args.private_key.address();
+
+        let order_monitor = Arc::new(order_monitor::OrderMonitor::new(
+            self.db.clone(),
+            self.provider.clone(),
+            chain_monitor.clone(),
+            config.clone(),
+            block_times,
+            prover_addr,
+            self.deployment().boundless_market_address,
+            pricing_rx,
+            stake_token_decimals,
+            order_monitor::RpcRetryConfig {
+                retry_count: self.args.rpc_retry_max.into(),
+                retry_sleep_ms: self.args.rpc_retry_backoff,
+            },
+        )?);
+        let cloned_config = config.clone();
+        let cancel_token = non_critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(order_monitor, cloned_config, cancel_token)
+                .spawn()
+                .await
+                .context("Failed to start order monitor")?;
+            Ok(())
+        });
+
+        let set_builder_img_id = self.fetch_and_upload_set_builder_image(&prover).await?;
+        let assessor_img_id = self.fetch_and_upload_assessor_image(&prover).await?;
+
+        let aggregator = Arc::new(
+            aggregator::AggregatorService::new(
+                self.db.clone(),
+                chain_id,
+                set_builder_img_id,
+                assessor_img_id,
+                self.deployment().boundless_market_address,
+                prover_addr,
+                config.clone(),
+                prover.clone(),
+            )
+            .await
+            .context("Failed to initialize aggregator service")?,
         );
-        // Original: tokio::time::Duration::from_secs(self.block_time),
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut new_orders = self.priced_order_rx.lock().await;
-        let mut prev_orders_by_status = String::new();
+        let cloned_config = config.clone();
+        let cancel_token = critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(aggregator, cloned_config, cancel_token)
+                .with_retry_policy(RetryPolicy::CRITICAL_SERVICE)
+                .spawn()
+                .await
+                .context("Failed to start aggregator service")?;
+            Ok(())
+        });
 
+        // Start the ReaperTask to check for expired committed orders
+        let reaper =
+            Arc::new(reaper::ReaperTask::new(self.db.clone(), config.clone(), prover.clone()));
+        let cloned_config = config.clone();
+        // Using critical cancel token to ensure no stuck expired jobs on shutdown
+        let cancel_token = critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(reaper, cloned_config, cancel_token)
+                .spawn()
+                .await
+                .context("Failed to start reaper service")?;
+            Ok(())
+        });
+
+        let submitter = Arc::new(submitter::Submitter::new(
+            self.db.clone(),
+            config.clone(),
+            prover.clone(),
+            self.provider.clone(),
+            self.deployment().set_verifier_address,
+            self.deployment().boundless_market_address,
+            set_builder_img_id,
+        )?);
+        let cloned_config = config.clone();
+        let cancel_token = critical_cancel_token.clone();
+        supervisor_tasks.spawn(async move {
+            Supervisor::new(submitter, cloned_config, cancel_token)
+                .with_retry_policy(RetryPolicy::CRITICAL_SERVICE)
+                .spawn()
+                .await
+                .context("Failed to start submitter service")?;
+            Ok(())
+        });
+
+        // Monitor the different supervisor tasks and handle shutdown
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to install SIGINT handler");
         loop {
+            tracing::info!("Waiting for supervisor tasks to complete...");
             tokio::select! {
-                // Process new orders from the channel as soon as they arrive
-                biased;
-
-                Some(result) = new_orders.recv() => {
-                    self.handle_new_order_result(result).await?;
-                }
-
-                // On each interval, process all pending orders and do the block-based logic
-                _ = interval.tick() => {
-                    let ChainHead { block_number, block_timestamp } =
-                        self.chain_monitor.current_chain_head().await?;
-                    if block_number != last_block {
-                        last_block = block_number;
-                        if first_block == 0 {
-                            first_block = block_number;
-                        }
-                        tracing::trace!(
-                            "Order monitor processing block {block_number} at timestamp {block_timestamp}"
-                        );
-
-                        let monitor_config = {
-                            let config = self.config.lock_all().context("Failed to read config")?;
-                            OrderMonitorConfig {
-                                min_deadline: config.market.min_deadline,
-                                peak_prove_khz: config.market.peak_prove_khz,
-                                max_concurrent_proofs: config.market.max_concurrent_proofs,
-                                additional_proof_cycles: config.market.additional_proof_cycles,
-                                batch_buffer_time_secs: config.batcher.block_deadline_buffer_secs,
-                                order_commitment_priority: config.market.order_commitment_priority,
-                                priority_addresses: config.market.priority_requestor_addresses.clone(),
-                            }
-                        };
-
-                        // Get orders that are valid and ready for locking/proving, skipping orders that are now invalid for proving, due to expiring, being locked by another prover, etc.
-                        let mut valid_orders = self.get_valid_orders(block_timestamp, monitor_config.min_deadline).await?;
-
-                        if valid_orders.is_empty() {
-                            tracing::trace!(
-                                "No orders to lock and/or prove as of block timestamp {}",
-                                block_timestamp
-                            );
+                // Handle supervisor task results
+                Some(res) = supervisor_tasks.join_next() => {
+                    let status = match res {
+                        Err(join_err) if join_err.is_cancelled() => {
+                            tracing::info!("Tokio task exited with cancellation status: {join_err:?}");
                             continue;
                         }
-
-                        // Prioritize the orders that intend to fulfill based on configured commitment priority.
-                        valid_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
-
-                        // Filter down the orders given our max concurrent proofs, peak khz limits, and gas limitations.
-                        let final_orders = self
-                            .apply_capacity_limits(
-                                valid_orders,
-                                &monitor_config,
-                                &mut prev_orders_by_status,
-                            )
-                            .await?;
-
-                        tracing::trace!("After processing block {}[timestamp {}], we will now start locking and/or proving {} orders.",
-                            block_number,
-                            block_timestamp,
-                            final_orders.len(),
-                        );
-
-                        if !final_orders.is_empty() {
-                            // Lock and prove filtered orders.
-                            self.lock_and_prove_orders(&final_orders).await?;
+                        Err(join_err) => {
+                            tracing::error!("Tokio task exited with error status: {join_err:?}");
+                            anyhow::bail!("Task exited with error status: {join_err:?}")
+                        }
+                        Ok(status) => status,
+                    };
+                    match status {
+                        Err(err) => {
+                            tracing::error!("Task exited with error status: {err:?}");
+                            anyhow::bail!("Task exited with error status: {err:?}")
+                        }
+                        Ok(()) => {
+                            tracing::info!("Task exited with ok status");
                         }
                     }
                 }
-                _ = cancel_token.cancelled() => {
-                    tracing::debug!("Order monitor received cancellation");
+                // Handle shutdown signals
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Received CTRL+C, starting graceful shutdown...");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, starting graceful shutdown...");
+                    break;
+                }
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT, starting graceful shutdown...");
                     break;
                 }
             }
         }
+
+        // Phase 1: Cancel non-critical tasks immediately to stop taking new work
+        tracing::info!("Cancelling non-critical tasks (order discovery, picking, monitoring)...");
+        non_critical_cancel_token.cancel();
+
+        // Phase 2: Wait for committed orders to complete, then cancel critical tasks
+        self.shutdown_and_cancel_critical_tasks(critical_cancel_token).await?;
+
         Ok(())
     }
 
-    // Called when a new order result is received from the channel
-    async fn handle_new_order_result(
+    async fn shutdown_and_cancel_critical_tasks(
         &self,
-        order: Box<OrderRequest>,
-    ) -> Result<(), OrderMonitorErr> {
-        // 改为默认“立即执行”策略：
-        // - LockAndFulfill: 直接尝试上链锁定；成功则入库为 PendingProving，失败则标记为 Skipped
-        // - 其他类型：无需锁定，直接入库为 PendingProving
-        match order.fulfillment_type {
-            FulfillmentType::LockAndFulfill => {
-                // 仅锁定由指定请求方地址发出的订单
-                let allow_addr = Address::from_str("0xc2db89b2bd434ceac6c74fbc0b2ad3a280e66db0")
-                    .expect("invalid allow address literal");
-                let req_id_u256: U256 = U256::from(order.request.id);
-                let requestor_addr = RequestId::from_lossy(req_id_u256).addr;
-                if requestor_addr != allow_addr {
-                    tracing::debug!(
-                        "忽略非白名单请求方订单: {} (requestor: {}, allow: {})",
-                        order.id(),
-                        requestor_addr,
-                        allow_addr
-                    );
-                    return Ok(());
-                }
-                let order_id = order.id();
-                let request_id = order.request.id;
-                match self.lock_order(&order).await {
-                    Ok(lock_price) => {
-                        tracing::info!(
-                            "🔒 即刻锁定成功: {} (request 0x{:x})",
-                            order_id,
-                            request_id
-                        );
-                        if let Err(err) = self.db.insert_accepted_request(&order, lock_price).await {
-                                tracing::error!(
-                                    "严重风险：订单 {} 从锁定更新为待证明失败：{}",
-                                    order_id,
-                                    err
-                                );
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "❌ 即刻锁定失败: {} - {:?}",
-                            order_id,
-                            err
-                        );
-                        if let Err(db_err) = self.db.insert_skipped_request(&order).await {
-                            tracing::error!(
-                                "写入失败状态到数据库失败：订单 {} - {:?}",
-                                order_id,
-                                db_err
-                            );
-                        }
-                    }
-                }
+        critical_cancel_token: CancellationToken,
+    ) -> Result<(), anyhow::Error> {
+        // 2 hour max to shutdown time, to avoid indefinite shutdown time.
+        const SHUTDOWN_GRACE_PERIOD_SECS: u32 = 2 * 60 * 60;
+        const SLEEP_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let start_time = std::time::Instant::now();
+        let grace_period = std::time::Duration::from_secs(SHUTDOWN_GRACE_PERIOD_SECS as u64);
+        let mut last_log = "".to_string();
+        while start_time.elapsed() < grace_period {
+            let in_progress_orders = self.db.get_committed_orders().await?;
+            if in_progress_orders.is_empty() {
+                break;
             }
-            FulfillmentType::FulfillAfterLockExpire | FulfillmentType::FulfillWithoutLocking => {
-                let order_id = order.id();
-                if let Err(err) = self.db.insert_accepted_request(&order, U256::ZERO).await {
-                    tracing::error!(
-                        "设置订单为待证明状态失败：{} - {:?}",
-                        order_id,
-                        err
-                    );
-                } else {
-                    tracing::info!("✅ 即刻接受非锁定订单进入证明: {}", order_id);
-                }
+
+            let new_log = format!(
+                "Waiting for {} in-progress orders to complete...\n{}",
+                in_progress_orders.len(),
+                in_progress_orders
+                    .iter()
+                    .map(|order| { format!("[{:?}] {}", order.status, order) })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+
+            if new_log != last_log {
+                tracing::info!("{}", new_log);
+                last_log = new_log;
             }
+
+            tokio::time::sleep(SLEEP_DURATION).await;
+        }
+
+        // Cancel critical tasks after committed work completes (or timeout)
+        tracing::info!("Cancelling critical tasks...");
+        critical_cancel_token.cancel();
+
+        if start_time.elapsed() >= grace_period {
+            let in_progress_orders = self.db.get_committed_orders().await?;
+            tracing::info!(
+                "Shutdown timed out after {} seconds. Exiting with {} in-progress orders: {}",
+                SHUTDOWN_GRACE_PERIOD_SECS,
+                in_progress_orders.len(),
+                in_progress_orders
+                    .iter()
+                    .map(|order| format!("[{:?}] {}", order.status, order))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        } else {
+            tracing::info!("Shutdown complete");
         }
         Ok(())
     }
 }
 
-impl<P> RetryTask for OrderMonitor<P>
-where
-    P: Provider<Ethereum> + WalletProvider + 'static + Clone,
-{
-    type Error = OrderMonitorErr;
-    fn spawn(&self, cancel_token: CancellationToken) -> RetryRes<Self::Error> {
-        let monitor_clone = self.clone();
-        Box::pin(async move {
-            tracing::info!("Starting order monitor");
-            monitor_clone.start_monitor(cancel_token).await.map_err(SupervisorErr::Recover)?;
-            Ok(())
-        })
+/// A very small utility function to get the current unix timestamp in seconds.
+// TODO(#379): Avoid drift relative to the chain's timestamps.
+pub(crate) fn now_timestamp() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+}
+
+// Utility function to format the expiries of a request in a human readable format
+fn format_expiries(request: &ProofRequest) -> String {
+    let now: i64 = now_timestamp().try_into().unwrap();
+    let lock_expires_at: i64 = request.lock_expires_at().try_into().unwrap();
+    let lock_expires_delta = lock_expires_at - now;
+    let lock_expires_delta_str = if lock_expires_delta > 0 {
+        format!("{lock_expires_delta} seconds from now")
+    } else {
+        format!("{} seconds ago", lock_expires_delta.abs())
+    };
+    let expires_at: i64 = request.expires_at().try_into().unwrap();
+    let expires_at_delta = expires_at - now;
+    let expires_at_delta_str = if expires_at_delta > 0 {
+        format!("{expires_at_delta} seconds from now")
+    } else {
+        format!("{} seconds ago", expires_at_delta.abs())
+    };
+    format!(
+        "lock expires at {lock_expires_at} ({lock_expires_delta_str}), expires at {expires_at} ({expires_at_delta_str})"
+    )
+}
+
+/// Returns `true` if the dev mode environment variable is enabled.
+pub(crate) fn is_dev_mode() -> bool {
+    std::env::var("RISC0_DEV_MODE")
+        .ok()
+        .map(|x| x.to_lowercase())
+        .filter(|x| x == "1" || x == "true" || x == "yes")
+        .is_some()
+}
+
+#[cfg(feature = "test-utils")]
+pub mod test_utils {
+    use alloy::network::Ethereum;
+    use alloy::providers::{Provider, WalletProvider};
+    use anyhow::Result;
+    use boundless_market_test_utils::{TestCtx, ASSESSOR_GUEST_PATH, SET_BUILDER_PATH};
+    use tempfile::NamedTempFile;
+    use url::Url;
+
+    use crate::{config::Config, Args, Broker};
+
+    pub struct BrokerBuilder<P> {
+        args: Args,
+        provider: P,
+        config_file: NamedTempFile,
+    }
+
+    impl<P> BrokerBuilder<P>
+    where
+        P: Provider<Ethereum> + 'static + Clone + WalletProvider,
+    {
+        pub async fn new_test(ctx: &TestCtx<P>, rpc_url: Url) -> Self {
+            let config_file: NamedTempFile = NamedTempFile::new().unwrap();
+            let mut config = Config::default();
+            config.prover.set_builder_guest_path = Some(SET_BUILDER_PATH.into());
+            config.prover.assessor_set_guest_path = Some(ASSESSOR_GUEST_PATH.into());
+            config.market.mcycle_price = "0.00001".into();
+            config.batcher.min_batch_size = Some(1);
+            config.write(config_file.path()).await.unwrap();
+
+            let args = Args {
+                db_url: "sqlite::memory:".into(),
+                config_file: config_file.path().to_path_buf(),
+                deployment: Some(ctx.deployment.clone()),
+                rpc_url,
+                private_key: ctx.prover_signer.clone(),
+                bento_api_url: None,
+                bonsai_api_key: None,
+                bonsai_api_url: None,
+                deposit_amount: None,
+                rpc_retry_max: 0,
+                rpc_retry_backoff: 200,
+                rpc_retry_cu: 1000,
+                log_json: false,
+            };
+            Self { args, provider: ctx.prover_provider.clone(), config_file }
+        }
+
+        pub fn with_db_url(mut self, db_url: String) -> Self {
+            self.args.db_url = db_url;
+            self
+        }
+
+        pub async fn build(self) -> Result<(Broker<P>, NamedTempFile)> {
+            Ok((Broker::new(self.args, self.provider).await?, self.config_file))
+        }
     }
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use crate::OrderStatus;
-    use crate::{db::SqliteDb, now_timestamp, FulfillmentType};
-    use alloy::node_bindings::AnvilInstance;
-    use alloy::{
-        network::EthereumWallet,
-        node_bindings::Anvil,
-        primitives::{Address, U256},
-        providers::{
-            fillers::{
-                BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
-                WalletFiller,
-            },
-            ProviderBuilder, RootProvider,
-        },
-        signers::local::PrivateKeySigner,
-    };
-    use boundless_market::contracts::{
-        Offer, Predicate, PredicateType, ProofRequest, RequestId, RequestInput, RequestInputType,
-        Requirements,
-    };
-    use boundless_market_test_utils::{
-        deploy_boundless_market, deploy_hit_points, ASSESSOR_GUEST_ID, ASSESSOR_GUEST_PATH,
-    };
-
-    use risc0_zkvm::Digest;
-    use std::{future::Future, sync::Arc};
-    use tokio::task::JoinSet;
-    use tracing_test::traced_test;
-
-    type TestProvider = FillProvider<
-        JoinFill<
-            JoinFill<
-                alloy::providers::Identity,
-                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-            >,
-            WalletFiller<EthereumWallet>,
-        >,
-        RootProvider,
-    >;
-
-    pub struct TestCtx {
-        pub monitor: OrderMonitor<TestProvider>,
-        pub anvil: AnvilInstance,
-        pub db: DbObj,
-        pub market_address: Address,
-        #[allow(dead_code)]
-        pub config: ConfigLock,
-        pub priced_order_tx: mpsc::Sender<Box<OrderRequest>>,
-        pub signer: PrivateKeySigner,
-        pub market_service: BoundlessMarketService<Arc<TestProvider>>,
-        next_order_id: u32, // Counter to assign unique order IDs
-    }
-
-    impl TestCtx {
-        // Convert the standalone function to a method on TestCtx
-        pub async fn create_test_order(
-            &mut self,
-            fulfillment_type: FulfillmentType,
-            bidding_start: u64,
-            lock_timeout: u64,
-            timeout: u64,
-        ) -> Box<OrderRequest> {
-            let request_id = self.next_order_id;
-            self.next_order_id += 1;
-
-            let request = ProofRequest::new(
-                RequestId::new(self.signer.address(), request_id),
-                Requirements::new(
-                    Digest::ZERO,
-                    Predicate {
-                        predicateType: PredicateType::PrefixMatch,
-                        data: Default::default(),
-                    },
-                ),
-                "http://risczero.com/image",
-                RequestInput { inputType: RequestInputType::Inline, data: Default::default() },
-                Offer {
-                    minPrice: U256::from(1),
-                    maxPrice: U256::from(2),
-                    biddingStart: bidding_start,
-                    rampUpPeriod: 1,
-                    timeout: timeout as u32,
-                    lockTimeout: lock_timeout as u32,
-                    lockStake: U256::from(0),
-                },
-            );
-
-            let client_sig = request
-                .sign_request(&self.signer, self.market_address, self.anvil.chain_id())
-                .await
-                .unwrap()
-                .as_bytes()
-                .into();
-
-            Box::new(OrderRequest {
-                target_timestamp: Some(0),
-                request,
-                image_id: None,
-                input_id: None,
-                expire_timestamp: None,
-                client_sig,
-                fulfillment_type,
-                boundless_market_address: self.market_address,
-                chain_id: self.anvil.chain_id(),
-                total_cycles: None,
-            })
-        }
-    }
-
-    pub async fn setup_om_test_context() -> TestCtx {
-        let anvil = Anvil::new().spawn();
-        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
-        let provider = Arc::new(
-            ProviderBuilder::new()
-                .wallet(EthereumWallet::from(signer.clone()))
-                .connect(&anvil.endpoint())
-                .await
-                .unwrap(),
-        );
-
-        // Deploy contracts
-        let hit_points = deploy_hit_points(signer.address(), provider.clone()).await.unwrap();
-
-        let market_address = deploy_boundless_market(
-            signer.address(),
-            provider.clone(),
-            Address::ZERO,
-            hit_points,
-            Digest::from(ASSESSOR_GUEST_ID),
-            format!("file://{ASSESSOR_GUEST_PATH}"),
-            Some(signer.address()),
-        )
-        .await
-        .unwrap();
-
-        // Set up market service
-        let market_service = BoundlessMarketService::new(
-            market_address,
-            provider.clone(),
-            provider.default_signer_address(),
-        );
-
-        // Deposit ETH into the contract for the prover to use when locking orders
-        // Using 10 ETH to ensure plenty of funds for tests
-        let stake_token_decimals = market_service.stake_token_decimals().await.unwrap();
-        market_service
-            .deposit(parse_units("10.0", stake_token_decimals).unwrap().into())
-            .await
-            .unwrap();
-
-        let db: DbObj = Arc::new(SqliteDb::new("sqlite::memory:").await.unwrap());
-        let config = ConfigLock::default();
-
-        config.load_write().unwrap().market.min_deadline = 50;
-        config.load_write().unwrap().market.lockin_gas_estimate = 200_000;
-        config.load_write().unwrap().market.fulfill_gas_estimate = 300_000;
-        config.load_write().unwrap().market.groth16_verify_gas_estimate = 50_000;
-
-        let block_time = 2;
-
-        let chain_monitor = Arc::new(ChainMonitorService::new(provider.clone()).await.unwrap());
-        tokio::spawn(chain_monitor.spawn(Default::default()));
-
-        // Create required channels for tests
-        let (priced_order_tx, priced_order_rx) = mpsc::channel(16);
-
-        let monitor = OrderMonitor::new(
-            db.clone(),
-            provider.clone(),
-            chain_monitor.clone(),
-            config.clone(),
-            block_time,
-            signer.address(),
-            market_address,
-            priced_order_rx,
-            stake_token_decimals,
-            RpcRetryConfig { retry_count: 2, retry_sleep_ms: 500 },
-        )
-        .unwrap();
-
-        TestCtx {
-            monitor,
-            anvil,
-            db,
-            market_address,
-            config,
-            priced_order_tx,
-            signer,
-            market_service,
-            next_order_id: 1, // Initialize with 1 instead of 0
-        }
-    }
-
-    async fn run_with_monitor<P, F, T>(monitor: OrderMonitor<P>, f: F) -> T
-    where
-        P: Provider + WalletProvider + Clone + 'static,
-        F: Future<Output = T>,
-    {
-        // A JoinSet automatically aborts all its tasks when dropped
-        let mut tasks = JoinSet::new();
-        // Spawn the monitor
-        tasks.spawn(async move { monitor.start_monitor(Default::default()).await });
-
-        tokio::select! {
-            result = f => result,
-            monitor_task_result = tasks.join_next() => {
-                panic!("Monitor exited unexpectedly: {:?}", monitor_task_result.unwrap());
-            },
-        }
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn monitor_block() {
-        let mut ctx = setup_om_test_context().await;
-
-        // Create a test order using the TestCtx helper method
-        let order =
-            ctx.create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 100, 200).await;
-
-        let order_id = order.id();
-
-        let _request_id =
-            ctx.market_service.submit_request(&order.request, &ctx.signer).await.unwrap();
-
-        // Send the order to the monitor
-        ctx.priced_order_tx.send(order).await.unwrap();
-
-        run_with_monitor(ctx.monitor, async move {
-            // loop for 20 seconds
-            for _ in 0..20 {
-                let order = ctx.db.get_order(&order_id).await.unwrap();
-                if order.is_some() {
-                    assert_eq!(order.unwrap().status, OrderStatus::PendingProving);
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            }
-
-            let order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-            assert_eq!(order.status, OrderStatus::PendingProving);
-        })
-        .await;
-    }
-
-    // Capacity tests
-    #[test]
-    fn test_capacity_unlimited() {
-        let capacity = Capacity::Unlimited;
-        assert_eq!(capacity.request_capacity(0), 0);
-        assert_eq!(capacity.request_capacity(15), MAX_PROVING_BATCH_SIZE);
-        assert_eq!(capacity.request_capacity(MAX_PROVING_BATCH_SIZE), MAX_PROVING_BATCH_SIZE);
-    }
-
-    #[test]
-    fn test_capacity_proving() {
-        let capacity = Capacity::Available(50);
-        assert_eq!(capacity.request_capacity(0), 0);
-        assert_eq!(capacity.request_capacity(4), 4);
-        assert_eq!(capacity.request_capacity(10), MAX_PROVING_BATCH_SIZE);
-    }
-
-    // Filtering tests
-    #[tokio::test]
-    #[traced_test]
-    async fn test_filter_expired_orders() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        // Create an expired order
-        let expired_order = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp - 100, 50, 50)
-            .await;
-        let expired_order_id = expired_order.id();
-        ctx.monitor
-            .lock_and_prove_cache
-            .insert(expired_order_id.clone(), Arc::from(expired_order))
-            .await;
-
-        let result = ctx.monitor.get_valid_orders(current_timestamp, 0).await.unwrap();
-
-        assert!(result.is_empty());
-
-        let order = ctx.db.get_order(&expired_order_id).await.unwrap().unwrap();
-        assert_eq!(order.status, OrderStatus::Skipped);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_filter_insufficient_deadline() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        // Create an order with insufficient deadline
-        let order =
-            ctx.create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 45, 45).await;
-        let order_1_id = order.id();
-        ctx.monitor.lock_and_prove_cache.insert(order_1_id.clone(), Arc::from(order)).await;
-
-        // Create an order with insufficient deadline
-        let order = ctx
-            .create_test_order(FulfillmentType::FulfillAfterLockExpire, current_timestamp, 1, 45)
-            .await;
-        let order_2_id = order.id();
-        ctx.monitor.prove_cache.insert(order_2_id.clone(), Arc::from(order)).await;
-
-        let result = ctx.monitor.get_valid_orders(current_timestamp, 100).await.unwrap();
-
-        assert!(result.is_empty());
-
-        let order = ctx.db.get_order(&order_1_id).await.unwrap().unwrap();
-        assert_eq!(order.status, OrderStatus::Skipped);
-
-        let order = ctx.db.get_order(&order_2_id).await.unwrap().unwrap();
-        assert_eq!(order.status, OrderStatus::Skipped);
-    }
-
-    #[tokio::test]
-    async fn test_filter_locked_by_others() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        // Create an order that's locked by another prover
-        let order = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-            .await;
-        let order_id = order.id();
-        ctx.db
-            .set_request_locked(
-                U256::from(order.request.id),
-                &Address::ZERO.to_string(),
-                current_timestamp,
-            )
-            .await
-            .unwrap();
-        ctx.monitor.lock_and_prove_cache.insert(order.id(), Arc::from(order)).await;
-
-        let result =
-            ctx.monitor.get_valid_orders(current_timestamp, current_timestamp + 100).await.unwrap();
-
-        assert!(result.is_empty());
-
-        let order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-        assert_eq!(order.status, OrderStatus::Skipped);
-    }
-
-    // Processing tests
-    #[tokio::test]
-    #[traced_test]
-    async fn test_process_fulfill_after_lock_expire_orders() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        let order = ctx
-            .create_test_order(FulfillmentType::FulfillAfterLockExpire, current_timestamp, 100, 200)
-            .await;
-        let order_id = order.id();
-
-        ctx.monitor.lock_and_prove_orders(&[Arc::from(order)]).await.unwrap();
-
-        let updated_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-        assert_eq!(updated_order.status, OrderStatus::PendingProving);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_apply_capacity_limits_unlimited() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        // Create multiple orders
-        let mut orders = Vec::new();
-        for _ in 1..=5 {
-            let order = ctx
-                .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-                .await;
-
-            // Submit requests to blockchain
-            let _request_id =
-                ctx.market_service.submit_request(&order.request, &ctx.signer).await.unwrap();
-
-            orders.push(Arc::from(order));
-        }
-
-        // Set unlimited capacity in config
-        ctx.config.load_write().unwrap().market.max_concurrent_proofs = None;
-
-        // Process all orders with unlimited capacity
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(
-                orders.clone(),
-                &OrderMonitorConfig::default(),
-                &mut String::new(),
-            )
-            .await
-            .unwrap();
-        let result = ctx.monitor.lock_and_prove_orders(&filtered_orders).await;
-        assert!(result.is_ok(), "lock_and_prove_orders should succeed");
-
-        // All orders should be processed since capacity is unlimited
-        let mut processed_count = 0;
-        for order in orders {
-            if let Some(order) = ctx.db.get_order(&order.id()).await.unwrap() {
-                processed_count += 1;
-                assert_eq!(order.status, OrderStatus::PendingProving);
-            }
-        }
-
-        // Should process all 5 orders
-        assert_eq!(
-            processed_count, 5,
-            "Should have processed all 5 orders with unlimited capacity"
-        );
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_apply_capacity_limits_proving() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        // Add a committed order to simulate existing workload
-        let committed_order = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-            .await;
-        let mut committed_order = committed_order.to_proving_order(Default::default());
-        committed_order.status = OrderStatus::Proving;
-        committed_order.proving_started_at = Some(current_timestamp);
-        ctx.db.add_order(&committed_order).await.unwrap();
-
-        // Create multiple new orders
-        let mut orders = Vec::new();
-        for _ in 1..=5 {
-            let order = ctx
-                .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-                .await;
-
-            // Submit requests to blockchain
-            let _request_id =
-                ctx.market_service.submit_request(&order.request, &ctx.signer).await.unwrap();
-
-            orders.push(Arc::from(order));
-        }
-
-        // Process orders with limited capacity
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(
-                orders,
-                &OrderMonitorConfig {
-                    max_concurrent_proofs: Some(3),
-                    order_commitment_priority: OrderCommitmentPriority::ShortestExpiry,
-                    ..Default::default()
-                },
-                &mut String::new(),
-            )
-            .await
-            .unwrap();
-        ctx.monitor.lock_and_prove_orders(&filtered_orders).await.unwrap();
-
-        // Count processed orders
-        let mut processed_count = 0;
-        for order in filtered_orders {
-            if let Some(order) = ctx.db.get_order(&order.id()).await.unwrap() {
-                processed_count += 1;
-                assert_eq!(order.status, OrderStatus::PendingProving);
-            }
-        }
-
-        // Should only process 2 more orders (3 total with 1 already committed)
-        assert_eq!(
-            processed_count, 2,
-            "Should have processed only 2 more orders due to concurrent proving capacity limit"
-        );
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_apply_capacity_limits_committed_work_too_large() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        // Add a large committed order to simulate existing workload
-        let committed_order = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-            .await;
-        let mut committed_order = committed_order.to_proving_order(Default::default());
-        committed_order.status = OrderStatus::Proving;
-        committed_order.total_cycles = Some(10_000_000_000_000_000);
-        committed_order.proving_started_at = Some(current_timestamp);
-        ctx.db.add_order(&committed_order).await.unwrap();
-
-        let mut orders = Vec::new();
-
-        let mut order1 = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-            .await;
-        order1.total_cycles = Some(1000);
-
-        orders.push(Arc::from(order1));
-
-        let mut order2 = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-            .await;
-        order2.total_cycles = Some(100);
-        orders.push(Arc::from(order2));
-
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(
-                orders,
-                &OrderMonitorConfig { peak_prove_khz: Some(100), ..Default::default() },
-                &mut String::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(filtered_orders.len(), 0);
-        assert!(logs_contain("cannot be completed before its expiration"));
-        assert!(logs_contain("Started with 2 orders"));
-        assert!(logs_contain("filtered to 0 orders: []"));
-    }
-
-    #[tokio::test]
-    async fn test_apply_capacity_limits_skip_proof_time_past_expiration() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-
-        // Create orders with different expiration times
-        let mut candidate_orders = Vec::new();
-
-        // Order 1: Will expire soon (not enough time to prove)
-        let mut order1 =
-            ctx.create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 5, 5).await;
-        order1.total_cycles = Some(1000000000000);
-        let order1_id = order1.id();
-
-        let _request_id =
-            ctx.market_service.submit_request(&order1.request, &ctx.signer).await.unwrap();
-        candidate_orders.push(Arc::from(order1));
-
-        // Order 2: Longer expiration (enough time to prove)
-        let mut order2 = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
-            .await;
-        order2.total_cycles = Some(2000);
-        let order2_id = order2.id();
-        let _request_id =
-            ctx.market_service.submit_request(&order2.request, &ctx.signer).await.unwrap();
-        candidate_orders.push(Arc::from(order2));
-
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(
-                candidate_orders,
-                &OrderMonitorConfig { peak_prove_khz: Some(1), ..Default::default() },
-                &mut String::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(filtered_orders[0].total_cycles, Some(2000));
-        assert_eq!(filtered_orders[0].id(), order2_id);
-
-        // The first order should be skipped due to insufficient proof time before expiration
-        let order1_db = ctx.db.get_order(&order1_id).await.unwrap();
-        assert_eq!(
-            order1_db.unwrap().status,
-            OrderStatus::Skipped,
-            "Order 1 should be skipped due to insufficient time to complete proof"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_gas_estimation_functions() {
-        let mut ctx = setup_om_test_context().await;
-
-        // Create orders with different fulfillment types to test gas estimation for each type
-        let lock_and_fulfill_order =
-            ctx.create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 100, 200).await;
-        let lock_and_fulfill_id = lock_and_fulfill_order.id();
-
-        let fulfill_only_order = ctx
-            .create_test_order(FulfillmentType::FulfillAfterLockExpire, now_timestamp(), 100, 200)
-            .await;
-        let fulfill_only_id = fulfill_only_order.id();
-
-        let _lock_request_id = ctx
-            .market_service
-            .submit_request(&lock_and_fulfill_order.request, &ctx.signer)
-            .await
-            .unwrap();
-        let _fulfill_request_id = ctx
-            .market_service
-            .submit_request(&fulfill_only_order.request, &ctx.signer)
-            .await
-            .unwrap();
-
-        let orders = vec![Arc::from(lock_and_fulfill_order), Arc::from(fulfill_only_order)];
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(orders, &OrderMonitorConfig::default(), &mut String::new())
-            .await
-            .unwrap();
-        let result = ctx.monitor.lock_and_prove_orders(&filtered_orders).await;
-        assert!(result.is_ok(), "lock_and_prove_orders should succeed");
-
-        // Verify both orders were processed correctly
-        let lock_order_result = ctx.db.get_order(&lock_and_fulfill_id).await.unwrap();
-        let fulfill_order_result = ctx.db.get_order(&fulfill_only_id).await.unwrap();
-
-        assert!(lock_order_result.is_some(), "Lock and fulfill order should be processed");
-        assert!(fulfill_order_result.is_some(), "Fulfill only order should be processed");
-
-        assert_eq!(lock_order_result.unwrap().status, OrderStatus::PendingProving);
-        assert_eq!(fulfill_order_result.unwrap().status, OrderStatus::PendingProving);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_multiple_orders_khz_capacity() {
-        let mut ctx = setup_om_test_context().await;
-        ctx.config.load_write().unwrap().market.max_concurrent_proofs = None;
-
-        // Create multiple orders with increasing cycle counts to test gas allocation
-        let mut orders = Vec::new();
-        for i in 1..6 {
-            let mut order = ctx
-                .create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 120, 120)
-                .await;
-
-            // Set increasing cycle counts to test different gas requirements
-            order.total_cycles = Some(i as u64 * 1_000_000);
-
-            let _request_id =
-                ctx.market_service.submit_request(&order.request, &ctx.signer).await.unwrap();
-
-            orders.push(Arc::from(order));
-        }
-
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(
-                orders,
-                &OrderMonitorConfig { peak_prove_khz: Some(100), ..Default::default() },
-                &mut String::new(),
-            )
-            .await
-            .unwrap();
-
-        println!("filtered_orders: {filtered_orders:?}");
-        // 100khz can prove 1m+2m+3m+4m (10m) cycles in 100 seconds
-        assert_eq!(filtered_orders.len(), 4);
-
-        assert_eq!(filtered_orders[0].total_cycles, Some(1_000_000));
-        assert_eq!(filtered_orders[3].total_cycles, Some(4_000_000));
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_insufficient_balance_committed_orders() {
-        let mut ctx = setup_om_test_context().await;
-
-        let balance = ctx.monitor.provider.get_balance(ctx.signer.address()).await.unwrap();
-        let gas_price = ctx.monitor.provider.get_gas_price().await.unwrap();
-        let gas_remaining: u64 = (balance / U256::from(gas_price)).try_into().unwrap();
-        ctx.config.load_write().unwrap().market.fulfill_gas_estimate = gas_remaining / 2;
-        ctx.config.load_write().unwrap().market.lockin_gas_estimate = gas_remaining / 3;
-
-        let incoming_order =
-            ctx.create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 100, 200).await;
-
-        let mut orders = vec![Arc::from(incoming_order)];
-
-        // Should be able to have enough gas for 1 lock and fulfill
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(
-                orders.clone(),
-                &OrderMonitorConfig::default(),
-                &mut String::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(filtered_orders.len(), 1);
-
-        orders.push(Arc::from(
-            ctx.create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 100, 200).await,
-        ));
-
-        // Should still only be able to have enough gas for 1 lock and fulfill
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(
-                orders.clone(),
-                &OrderMonitorConfig::default(),
-                &mut String::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(filtered_orders.len(), 1);
-
-        for _ in 0..3 {
-            let committed_order = ctx
-                .create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 100, 200)
-                .await;
-
-            let mut committed_order_obj = committed_order.to_proving_order(Default::default());
-            committed_order_obj.status = OrderStatus::Proving;
-            committed_order_obj.proving_started_at = Some(now_timestamp());
-            ctx.db.add_order(&committed_order_obj).await.unwrap();
-        }
-
-        // Process the order - with insufficient balance for committed orders
-        let filtered_orders = ctx
-            .monitor
-            .apply_capacity_limits(orders, &OrderMonitorConfig::default(), &mut String::new())
-            .await
-            .unwrap();
-
-        assert!(filtered_orders.is_empty());
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_target_timestamp_prevents_early_locking() {
-        let mut ctx = setup_om_test_context().await;
-        let current_timestamp = now_timestamp();
-        let future_timestamp = current_timestamp + 100; // 100 seconds in the future
-
-        // Create orders of both types and set them to be picked up at a future timestamp.
-        let mut lock_and_fulfill_order = ctx
-            .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 200, 300)
-            .await;
-
-        lock_and_fulfill_order.target_timestamp = Some(future_timestamp);
-        let lock_and_fulfill_order_id = lock_and_fulfill_order.id();
-
-        ctx.monitor
-            .lock_and_prove_cache
-            .insert(lock_and_fulfill_order.id(), Arc::from(lock_and_fulfill_order))
-            .await;
-
-        let mut fulfill_after_expire_order = ctx
-            .create_test_order(
-                FulfillmentType::FulfillAfterLockExpire,
-                current_timestamp - 50,
-                10,
-                300,
-            )
-            .await;
-
-        fulfill_after_expire_order.target_timestamp = Some(future_timestamp);
-        let fulfill_after_expire_order_id = fulfill_after_expire_order.id();
-
-        // Simulate that this order was locked by another prover but the lock has now expired
-        ctx.db
-            .set_request_locked(
-                U256::from(fulfill_after_expire_order.request.id),
-                &Address::ZERO.to_string(),
-                current_timestamp - 50,
-            )
-            .await
-            .unwrap();
-
-        ctx.monitor
-            .prove_cache
-            .insert(fulfill_after_expire_order.id(), Arc::from(fulfill_after_expire_order))
-            .await;
-
-        // Call get_valid_orders with current timestamp - this should NOT return either order
-        // because their target_timestamp is in the future
-        let valid_orders = ctx.monitor.get_valid_orders(current_timestamp, 50).await.unwrap();
-
-        assert!(
-            valid_orders.is_empty(),
-            "Orders with future target_timestamp should not be valid yet, got {} orders",
-            valid_orders.len()
-        );
-
-        // Verify both orders are still in their respective caches and not skipped
-        let cached_lock_order =
-            ctx.monitor.lock_and_prove_cache.get(&lock_and_fulfill_order_id).await;
-        assert!(cached_lock_order.is_some(), "LockAndFulfill order should still be in cache");
-
-        let cached_prove_order = ctx.monitor.prove_cache.get(&fulfill_after_expire_order_id).await;
-        assert!(
-            cached_prove_order.is_some(),
-            "FulfillAfterLockExpire order should still be in cache"
-        );
-
-        // Now test with future timestamp - both orders should be valid
-        let valid_orders_in_future =
-            ctx.monitor.get_valid_orders(future_timestamp + 1, 50).await.unwrap();
-
-        assert_eq!(
-            valid_orders_in_future.len(),
-            2,
-            "Both orders should be valid when current time >= target_timestamp"
-        );
-
-        assert!(valid_orders_in_future.iter().any(|order| order.id() == lock_and_fulfill_order_id));
-        assert!(valid_orders_in_future
-            .iter()
-            .any(|order| order.id() == fulfill_after_expire_order_id));
-    }
-}
+pub mod tests;
