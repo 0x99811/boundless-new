@@ -765,7 +765,7 @@ where
         .context("Failed to get stake token decimals. Possible RPC error.")?;
 
         // Spin up the order picker to pre-flight and find orders to lock
-        let order_picker = Arc::new(order_picker::OrderPicker::new(
+        let order_picker = Arc::new(order_monitor::OrderMonitor::new(
             self.db.clone(),
             config.clone(),
             prover.clone(),
