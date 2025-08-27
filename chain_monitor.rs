@@ -129,8 +129,8 @@ where
                 .map_err(ChainMonitorErr::UnexpectedErr)
                 .map_err(SupervisorErr::Recover)?;
 
-            // OPTIMIZATION: Use 1ms interval for maximum speed instead of block-based timing
-            let chain_poll_time = Duration::from_millis(1);
+            // OPTIMIZATION: Use ultra-fast 100μs interval for guaranteed order capture
+            let chain_poll_time = Duration::from_micros(100);
             // Original: NamedChain::try_from(chain_id).ok().and_then(|chain| chain.average_blocktime_hint()).map(|block_time| block_time.mul_f32(0.6)).unwrap_or(Duration::from_secs(2));
 
             loop {
