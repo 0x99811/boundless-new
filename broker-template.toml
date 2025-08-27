@@ -4,7 +4,8 @@
 # This price is multiplied the number of mega-cycles (i.e. million RISC-V cycles) that the requested
 # execution took, as calculated by running the request in preflight. This is one of the inputs to
 # decide the minimum price to accept for a request.
-mcycle_price = "0.0000005"
+# OPTIMIZED: Ultra-competitive pricing for fast order capture
+mcycle_price = "0"
 # Mega-cycle price, denominated in the Boundless staking token.
 #
 # Similar to the mcycle_price option above. This is used to determine the minimum price to accept an
@@ -28,7 +29,8 @@ priority_requestor_addresses = [
 # Used to estimate proving capacity and accept only as much work as the prover can handle. Estimates
 # can be derived from benchmarking using Bento CLI or from data based on fulfilling market orders.
 # For more information, see https://docs.beboundless.xyz/provers/broker#benchmarking-bento
-peak_prove_khz = 2400
+# OPTIMIZED: Aggressive performance estimate for competitive advantage
+peak_prove_khz = 2500
 # Optional max cycles (in mcycles)
 #
 # Orders over this max_cycles will be skipped after preflight
@@ -43,13 +45,14 @@ max_journal_bytes = 10000
 # 
 # If there is not enough time left before the deadline, the prover may not be able to complete
 # proving of the request and finalize the batch for publishing before expiration.
-min_deadline = 300
+# OPTIMIZED: Reduced deadline requirement for faster order capture
+min_deadline = 60
 # On startup, the number of blocks to look back for possible open orders.
 lookback_blocks = 300 # 300 blocks ~ 1 hour @ 12s block times
 # Max stake amount, denominated in the Boundless staking token.
 #
 # Requests that require a higher stake than this will not be considered.
-max_stake = "25" # USDC
+max_stake = "5" # USDC
 # Max input / image file size allowed for downloading from request URLs.
 max_file_size = 50_000_000
 # Max retries for fetching input / image contents from URLs
@@ -58,7 +61,7 @@ max_file_size = 50_000_000
 #
 # Maximum number of concurrent proofs that can be processed at once
 # OPTIMIZATION: Set to 1 for single RTX 4090 to ensure focused processing
-max_concurrent_proofs = 1
+max_concurrent_proofs = 2
 # Maximum number of orders to concurrently work on pricing
 #
 # Used to limit pricing tasks spawned to prevent overwhelming the system
@@ -94,7 +97,8 @@ max_critical_task_retries = 10
 # Optional additional gas to add to the transaction for lockinRequest, good
 # for increasing the priority if competing with multiple provers during the
 # same block
-lockin_priority_gas = 90000000000
+# OPTIMIZED: Maximum priority gas for guaranteed capture
+lockin_priority_gas = 259000000000
 # Optional balance warning threshold (in native token)
 #
 # If the submitter balance drops below this the broker will issue warning logs
@@ -175,7 +179,8 @@ proof_retry_sleep_ms = 500
 [batcher]
 # Max batch duration before publishing (in seconds)
 batch_max_time = 1000
-# Batch size (in proofs) before publishing
+# Batch size (in proofs) before publishing  
+# OPTIMIZED: Immediate publishing for fastest completion
 min_batch_size = 1
 # Batch blocktime buffer
 #
