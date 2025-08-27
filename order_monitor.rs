@@ -224,14 +224,14 @@ where
 
     async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
         let request_id = order.request.id;
-        // 无条件尝试：跳过链上/本地的预检查，直接尝试发起锁定交易
+        // 极速锁定：跳过所有预检查，直接发起锁定交易以获得最快响应
 
         let conf_priority_gas = {
             let conf = self.config.lock_all().context("Failed to lock config")?;
             conf.market.lockin_priority_gas
         };
 
-        tracing::info!("🔐 正在锁定请求(无条件尝试): 0x{:x} 质押金额: {}", request_id, order.request.offer.lockStake);
+        tracing::info!("⚡ 极速锁定请求: 0x{:x} 质押: {} ETH", request_id, format_ether(order.request.offer.lockStake));
         let lock_block = self
             .market
             .lock_request(&order.request, order.client_sig.clone(), conf_priority_gas)
@@ -516,18 +516,21 @@ where
                         .expect("invalid allow address literal");
                     let requestor_addr = RequestId::from_lossy(U256::from(order.request.id)).addr;
                     if requestor_addr != allow_addr {
-                        tracing::debug!(
-                            "忽略非白名单请求方订单: {} (requestor: {}, allow: {})",
+                        tracing::trace!(
+                            "⏭️ 跳过非白名单订单: {} (requestor: {}, target: {})",
                             order_id,
                             requestor_addr,
                             allow_addr
                         );
                         return;
                     }
+                    
+                    tracing::info!("🎯 发现目标地址订单: {} - 立即锁定!", order_id);
                     let request_id = order.request.id;
                     match self.lock_order(order).await {
                         Ok(lock_price) => {
-                            tracing::info!("🔒 成功锁定请求: 0x{:x}", request_id);
+                            tracing::info!("✅ 锁单成功 ❤️{}, transaction hash: 0x{:x}", 
+                                order_id.chars().take(42).collect::<String>(), request_id);
                             if let Err(err) = self.db.insert_accepted_request(order, lock_price).await {
                                 tracing::error!(
                                     "FATAL STAKE AT RISK: {} failed to move from locking -> proving status {}",
@@ -638,7 +641,7 @@ where
 
         // Get current gas price and available balance
         // OPTIMIZATION: Use hardcoded gas price to avoid RPC calls
-        let gas_price = 2_000_000_000u128; // 2 gwei - ultra low cost competitive pricing
+        let gas_price = 10_000_000_000u128; // 10.0 gwei - guaranteed priority pricing
         // Original: self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
         let available_balance_wei = self
             .provider
@@ -844,10 +847,10 @@ where
     ) -> Result<(), OrderMonitorErr> {
         let mut last_block = 0;
         let mut first_block = 0;
-        // OPTIMIZATION: Use 1ms interval for maximum order processing speed
+        // OPTIMIZATION: Use ultra-fast 100μs interval for guaranteed order capture
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now(),
-            tokio::time::Duration::from_millis(1),
+            tokio::time::Duration::from_micros(100),
         );
         // Original: tokio::time::Duration::from_secs(self.block_time),
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -950,21 +953,23 @@ where
                 let req_id_u256: U256 = U256::from(order.request.id);
                 let requestor_addr = RequestId::from_lossy(req_id_u256).addr;
                 if requestor_addr != allow_addr {
-                    tracing::debug!(
-                        "忽略非白名单请求方订单: {} (requestor: {}, allow: {})",
+                    tracing::trace!(
+                        "⏭️ 跳过非白名单新订单: {} (requestor: {}, target: {})",
                         order.id(),
                         requestor_addr,
                         allow_addr
                     );
                     return Ok(());
                 }
+                
+                tracing::info!("🎯 发现目标地址新订单: {} - 启动即时锁定!", order.id());
                 let order_id = order.id();
                 let request_id = order.request.id;
                 match self.lock_order(&order).await {
                     Ok(lock_price) => {
                         tracing::info!(
-                            "🔒 即刻锁定成功: {} (request 0x{:x})",
-                            order_id,
+                            "✅ 锁单成功 ❤️{}, transaction hash: 0x{:x}",
+                            order_id.chars().take(42).collect::<String>(),
                             request_id
                         );
                         if let Err(err) = self.db.insert_accepted_request(&order, lock_price).await {
