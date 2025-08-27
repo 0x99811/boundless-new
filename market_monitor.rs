@@ -224,7 +224,8 @@ where
             }
 
             tracing::info!(
-                "🎯 发现开放订单: {request_id:x} 状态: {req_status:?}, 准备处理 LockAndFulfill 类型订单",
+                "🎯 我到目标地址发起的交易! Hash: 0x{:x}",
+                request_id
             );
 
             let new_order = OrderRequest::new(
